@@ -37,6 +37,7 @@ from unreal import (
     resolve_frame_tasks,
     scan_episode_dirs,
     validate_media_meta,
+    validate_lerobot_dataset,
     validate_fixed_extrinsics,
     write_episode_extras_parquet,
 )
@@ -120,6 +121,23 @@ def write_episode(
 
 
 class UnrealConversionTests(unittest.TestCase):
+    def test_validate_lerobot_dataset_uses_local_metadata_only(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_lerobot_") as tmp:
+            root = Path(tmp)
+            (root / "meta").mkdir()
+            (root / "data" / "chunk-000").mkdir(parents=True)
+            (root / "videos" / "chunk-000" / "video.front").mkdir(parents=True)
+            info = {
+                "total_episodes": 1,
+                "chunks_size": 1000,
+                "features": {"video.front": {"dtype": "video"}},
+            }
+            (root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
+            (root / "data" / "chunk-000" / "episode_000000.parquet").touch()
+            (root / "videos" / "chunk-000" / "video.front" / "episode_000000.mp4").touch()
+
+            validate_lerobot_dataset("local-test", root)
+
     def test_find_undeclared_media_reports_png_residue(self):
         with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
             root = Path(tmp)

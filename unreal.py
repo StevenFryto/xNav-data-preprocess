@@ -1370,17 +1370,28 @@ def write_conversion_report(root: Path, report: dict[str, Any]):
 
 
 def validate_lerobot_dataset(repo_id: str, root: str | Path):
-    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-
-    meta = LeRobotDatasetMetadata(repo_id, root=root)
-    if meta.total_episodes == 0:
+    del repo_id  # Validation is intentionally local and must never query the Hub.
+    root = Path(root)
+    info_path = root / "meta" / "info.json"
+    if not info_path.exists():
+        raise ValueError(f"LeRobot info.json is missing: {info_path}")
+    info = load_json(info_path)
+    total_episodes = int(info.get("total_episodes", 0))
+    if total_episodes == 0:
         raise ValueError("Number of episodes is 0.")
-    for episode_index in range(meta.total_episodes):
-        data_path = meta.root / meta.get_data_file_path(episode_index)
+    chunks_size = int(info.get("chunks_size", 1000))
+    video_keys = [
+        key
+        for key, feature in (info.get("features") or {}).items()
+        if isinstance(feature, dict) and feature.get("dtype") == "video"
+    ]
+    for episode_index in range(total_episodes):
+        chunk = episode_index // chunks_size
+        data_path = root / f"data/chunk-{chunk:03d}/episode_{episode_index:06d}.parquet"
         if not data_path.exists():
             raise ValueError(f"Parquet file is missing: {data_path}")
-        for video_key in meta.video_keys:
-            video_path = meta.root / meta.get_video_file_path(episode_index, video_key)
+        for video_key in video_keys:
+            video_path = root / f"videos/chunk-{chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
             if not video_path.exists():
                 raise ValueError(f"Video file is missing: {video_path}")
 
