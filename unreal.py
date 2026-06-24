@@ -64,8 +64,8 @@ from __future__ import annotations
 scene 目录下还会额外写出：
     episodes_extras.parquet  # 每条 episode 一行，含 K_<camera>、Extrinsic_<camera> 等
     images/chunk-000/observation.depth.<camera>/episode_*/00000.png
-        # 如果原始 depth/<camera>/*.png 存在，会复制为 depth sidecar；
-        # 缺失 depth 不影响 LeRobot 主数据转换，会记录在转换报告中。
+        # 从 depth/<camera>.mp4 的 HueMp4 编码恢复为 uint16 毫米深度；
+        # 四路 depth 是必需模态，缺失或帧数不一致会跳过整个 episode。
 
 每帧 parquet 字段：
     annotation.human.action.task_description
@@ -606,6 +606,41 @@ def validate_media_meta(
     return recovered, repairs
 
 
+def find_undeclared_media(
+    episode_dir: Path,
+    media_meta: dict[str, Any],
+    modality: str,
+) -> list[dict[str, Any]]:
+    storage = str(media_meta.get("storage", "")).strip().lower()
+    warnings: list[dict[str, Any]] = []
+    for camera in media_meta.get("camera_names") or []:
+        video_path = episode_dir / modality / f"{camera}.mp4"
+        image_dir = episode_dir / modality / str(camera)
+        png_count = len(list(image_dir.glob("*.png"))) if image_dir.is_dir() else 0
+        if storage == "mp4" and png_count:
+            warnings.append(
+                {
+                    "source_episode_path": str(episode_dir),
+                    "stage": "media_selection",
+                    "modality": modality,
+                    "camera": str(camera),
+                    "warning": "ignored_undeclared_png_files",
+                    "count": png_count,
+                }
+            )
+        if storage == "png_sequence" and video_path.exists():
+            warnings.append(
+                {
+                    "source_episode_path": str(episode_dir),
+                    "stage": "media_selection",
+                    "modality": modality,
+                    "camera": str(camera),
+                    "warning": "ignored_undeclared_mp4",
+                }
+            )
+    return warnings
+
+
 @dataclass
 class CameraImageSource:
     video_path: Path | None
@@ -924,6 +959,7 @@ class UnrealEpisodeCollection:
         initial_failures: list[dict[str, Any]] | None = None,
         initial_repairs: list[dict[str, Any]] | None = None,
         initial_exclusions: list[dict[str, Any]] | None = None,
+        initial_warnings: list[dict[str, Any]] | None = None,
     ):
         self.raw_dir = Path(raw_dir)
         self.camera_keys = camera_keys
@@ -937,6 +973,7 @@ class UnrealEpisodeCollection:
         self.failed_episodes: list[dict[str, Any]] = list(initial_failures or [])
         self.repaired_episodes: list[dict[str, Any]] = list(initial_repairs or [])
         self.excluded_episodes: list[dict[str, Any]] = list(initial_exclusions or [])
+        self.warnings: list[dict[str, Any]] = list(initial_warnings or [])
         self.prepared_episodes: list[dict[str, Any]] = []
         self.successful_episodes: list[dict[str, Any]] = []
         self.schema_groups: dict[str, dict[str, Any]] = {}
@@ -1046,6 +1083,8 @@ class UnrealEpisodeCollection:
                             "repairs": metadata_repairs,
                         }
                     )
+                self.warnings.extend(find_undeclared_media(episode_dir, rgb_meta, "rgb"))
+                self.warnings.extend(find_undeclared_media(episode_dir, depth_meta, "depth"))
 
                 missing = [camera for camera in self.camera_keys if camera not in (meta.get("camera_names") or [])]
                 if missing:
@@ -1159,6 +1198,7 @@ class UnrealEpisodeCollection:
             initial_failures=self.failed_episodes,
             initial_repairs=self.repaired_episodes,
             initial_exclusions=[],
+            initial_warnings=self.warnings,
         )
 
     def for_episodes(
@@ -1180,6 +1220,7 @@ class UnrealEpisodeCollection:
             initial_failures=[],
             initial_repairs=[],
             initial_exclusions=[],
+            initial_warnings=[],
         )
 
     def __len__(self) -> int:
@@ -1249,19 +1290,20 @@ class UnrealEpisodeCollection:
                     "original_episode_index": item.get("original_episode_index"),
                     "frame_count": item.get("frame_count"),
                     "task": item.get("task", ""),
+                    "depth_decode_stats": item.get("depth_decode_stats", {}),
                 }
                 for item in extras
             ]
 
         success_sources = {item["source_episode_path"] for item in self.successful_episodes if item["source_episode_path"]}
-        existing_failures = {
-            (item.get("source_episode_path"), item.get("stage"))
+        failed_sources = {
+            item.get("source_episode_path")
             for item in self.failed_episodes
+            if item.get("source_episode_path")
         }
         for item in self.prepared_episodes:
             source_path = item["source_episode_path"]
-            key = (source_path, "output_validation")
-            if source_path not in success_sources and key not in existing_failures:
+            if source_path not in success_sources and source_path not in failed_sources:
                 self.failed_episodes.append(
                     {
                         "source_episode_path": source_path,
@@ -1269,7 +1311,7 @@ class UnrealEpisodeCollection:
                         "error": "episode was submitted but no episodes_extras entry was written",
                     }
                 )
-                existing_failures.add(key)
+                failed_sources.add(source_path)
 
     def build_report(self, root: Path, started_at: str, completed_at: str | None, status: str) -> dict[str, Any]:
         return {
@@ -1290,11 +1332,13 @@ class UnrealEpisodeCollection:
             "num_failed": len(self.failed_episodes),
             "num_repaired": len(self.repaired_episodes),
             "num_excluded": len(self.excluded_episodes),
+            "num_warnings": len(self.warnings),
             "prepared_episodes": self.prepared_episodes,
             "successful_episodes": self.successful_episodes,
             "failed_episodes": self.failed_episodes,
             "repaired_episodes": self.repaired_episodes,
             "excluded_episodes": self.excluded_episodes,
+            "warnings": self.warnings,
         }
 
 
@@ -1493,6 +1537,8 @@ def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name
         logging.info("Reading written episode metadata from %s", root / "meta" / "episodes_extras.jsonl")
         collection.sync_successful_episodes_from_output(root)
         sidecar_report = write_scene_sidecars(root, collection.camera_keys)
+        if sidecar_report["depth_sidecars"].get("status") == "failed":
+            raise ValueError("Depth sidecar validation failed")
         logging.info("Validating generated LeRobot dataset at %s", root)
         validate_lerobot_dataset(repo_id=dataset_name, root=root)
         status = "completed"
@@ -1584,6 +1630,7 @@ def main():
         "group_errors": group_errors,
         "scan_failures": collection.failed_episodes,
         "repaired_episodes": collection.repaired_episodes,
+        "warnings": collection.warnings,
     }
     top_report_path = output_dir / "unreal_conversion_report.json"
     write_json(top_report_path, top_report)

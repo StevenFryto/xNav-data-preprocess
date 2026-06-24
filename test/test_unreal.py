@@ -30,6 +30,7 @@ from unreal import (
     decode_hue_depth_rgb,
     group_episodes_by_scene,
     group_episodes_by_schema,
+    find_undeclared_media,
     intrinsic_matrix,
     intrinsic_4,
     load_media_meta,
@@ -119,6 +120,19 @@ def write_episode(
 
 
 class UnrealConversionTests(unittest.TestCase):
+    def test_find_undeclared_media_reports_png_residue(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
+            root = Path(tmp)
+            episode_dir, _ = write_episode(root, [make_frame(0, 0.0, 100.0)])
+            rgb_meta = load_media_meta(episode_dir, "rgb")
+            rgb_meta["storage"] = "mp4"
+
+            warnings = find_undeclared_media(episode_dir, rgb_meta, "rgb")
+
+            self.assertEqual(len(warnings), 1)
+            self.assertEqual(warnings[0]["warning"], "ignored_undeclared_png_files")
+            self.assertEqual(warnings[0]["count"], 1)
+
     def test_resolve_frame_tasks_maps_multiple_segments(self):
         tasks, status = resolve_frame_tasks(
             [
