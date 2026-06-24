@@ -232,6 +232,10 @@ class WorkerEpisodeBuilder:
         self.image_writer.stop()
         if remove_staging:
             shutil.rmtree(self.staging_dir, ignore_errors=True)
+            try:
+                self.staging_dir.parent.rmdir()
+            except OSError:
+                pass
             if self.episode_index is not None and self.chunk is not None:
                 parquet_path = (
                     self.root
@@ -312,6 +316,7 @@ def video_encoder_service(video_queue: mp.JoinableQueue):
             staging_dir = Path(temp_dir).parent
             try:
                 staging_dir.rmdir()
+                staging_dir.parent.rmdir()
             except OSError:
                 pass
         except Exception as e:

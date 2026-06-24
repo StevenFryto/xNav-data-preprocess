@@ -900,6 +900,10 @@ class UnrealEpisode:
                 }
         except Exception:
             shutil.rmtree(staging_root, ignore_errors=True)
+            try:
+                staging_parent.rmdir()
+            except OSError:
+                pass
             raise
 
         self.depth_decode_stats = stats
@@ -926,10 +930,20 @@ class UnrealEpisode:
                 raise FileExistsError(f"Depth sidecar output already exists: {target_dir}")
             shutil.move(str(source_dir), str(target_dir))
             prepared["committed_dirs"].append(target_dir)
-        shutil.rmtree(Path(prepared["staging_root"]), ignore_errors=True)
+        staging_root = Path(prepared["staging_root"])
+        shutil.rmtree(staging_root, ignore_errors=True)
+        try:
+            staging_root.parent.rmdir()
+        except OSError:
+            pass
 
     def discard_prepared_episode(self, prepared: dict[str, Any]):
-        shutil.rmtree(Path(prepared["staging_root"]), ignore_errors=True)
+        staging_root = Path(prepared["staging_root"])
+        shutil.rmtree(staging_root, ignore_errors=True)
+        try:
+            staging_root.parent.rmdir()
+        except OSError:
+            pass
         for path in prepared.get("committed_dirs", []):
             shutil.rmtree(Path(path), ignore_errors=True)
 
