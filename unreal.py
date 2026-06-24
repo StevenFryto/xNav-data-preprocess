@@ -654,6 +654,7 @@ class CameraImageSource:
         rgb_meta: dict[str, Any],
         camera_key: str,
         frame_count: int,
+        allow_extra_tail_frame: bool = False,
     ) -> "CameraImageSource":
         storage = str(rgb_meta.get("storage", "")).strip().lower()
         video_path = episode_dir / "rgb" / f"{camera_key}.mp4"
@@ -679,7 +680,10 @@ class CameraImageSource:
                 encoded_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
             finally:
                 capture.release()
-            if encoded_count > 0 and encoded_count != frame_count:
+            accepted_counts = {frame_count}
+            if allow_extra_tail_frame:
+                accepted_counts.add(frame_count + 1)
+            if encoded_count > 0 and encoded_count not in accepted_counts:
                 raise ValueError(
                     f"RGB video frame count mismatch for {episode_dir} camera {camera_key}: "
                     f"expected {frame_count}, got {encoded_count}"
@@ -752,6 +756,7 @@ class UnrealEpisode:
         self.rgb_meta = dict(rgb_meta) if rgb_meta is not None else load_media_meta(episode_dir, "rgb")
         self.depth_meta = dict(depth_meta) if depth_meta is not None else load_media_meta(episode_dir, "depth")
         self.depth_decode_stats: dict[str, Any] = {}
+        self.allow_extra_tail_frame = bool(self.meta.get("_trimmed_extra_tail_frame", False))
         self.frame_tasks = list(frame_tasks) if frame_tasks is not None else [task] * len(frames)
         self.task_indices = dict(task_indices or {task: task_idx})
         self.task_mapping = dict(task_mapping or {"status": "legacy_single_task"})
@@ -760,7 +765,13 @@ class UnrealEpisode:
                 f"frame task count mismatch: frames={len(self.frames)} tasks={len(self.frame_tasks)}"
             )
         self.image_sources = {
-            camera: CameraImageSource.from_episode(episode_dir, self.rgb_meta, camera, len(frames))
+            camera: CameraImageSource.from_episode(
+                episode_dir,
+                self.rgb_meta,
+                camera,
+                len(frames),
+                allow_extra_tail_frame=self.allow_extra_tail_frame,
+            )
             for camera in camera_keys
         }
 
@@ -864,10 +875,14 @@ class UnrealEpisode:
                             max_valid_mm = frame_max if max_valid_mm is None else max(max_valid_mm, frame_max)
 
                     ok, _ = capture.read()
+                    if ok and self.allow_extra_tail_frame:
+                        ok, _ = capture.read()
                     if ok:
                         raise ValueError(
                             f"Depth video frame count mismatch for {self.episode_dir} camera {camera}: "
-                            f"expected exactly {len(self.frames)} frames, video has more"
+                            f"expected {len(self.frames)}"
+                            f"{' or one compatible tail frame' if self.allow_extra_tail_frame else ''}, "
+                            "video has more"
                         )
                 finally:
                     capture.release()
@@ -1174,6 +1189,7 @@ class UnrealEpisodeCollection:
                     "trimmed_frame_index": last_frame_index,
                 }
                 self.repaired_episodes.append(repair)
+                meta["_trimmed_extra_tail_frame"] = True
                 logging.warning(
                     "Trimming one extra tail frame in %s: meta.frame_count=%d frames.jsonl=%d",
                     episode_dir,

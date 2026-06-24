@@ -445,6 +445,7 @@ class UnrealConversionTests(unittest.TestCase):
 
             self.assertEqual(len(collection), 1)
             self.assertEqual(len(collection.episodes[0][2]), 1)
+            self.assertTrue(collection.episodes[0][1]["_trimmed_extra_tail_frame"])
             self.assertEqual(len(collection.repaired_episodes), 1)
             self.assertEqual(collection.repaired_episodes[0]["action"], "trimmed_extra_tail_frame")
 
