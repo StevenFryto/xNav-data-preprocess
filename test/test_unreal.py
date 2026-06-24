@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -24,7 +27,6 @@ from unreal import (
     UnrealEpisodeCollection,
     body_from_camera_for_frame,
     build_features,
-    copy_depth_sidecars,
     decode_hue_depth_rgb,
     group_episodes_by_scene,
     group_episodes_by_schema,
@@ -421,23 +423,66 @@ class UnrealConversionTests(unittest.TestCase):
             self.assertEqual(df.loc[0, "scene_id"], "scene_0001")
             self.assertIn("100.0", df.loc[0, "K_front"])
 
-    def test_copy_depth_sidecars(self):
+    def test_prepare_and_commit_hue_depth_sidecars(self):
         with tempfile.TemporaryDirectory(prefix="unreal_sidecar_") as tmp:
             root = Path(tmp)
             raw_root = root / "raw"
-            episode_dir, _ = write_episode(raw_root, [make_frame(0, 0.0, 100.0), make_frame(1, 100.0, 200.0)], write_depth=True)
-            meta_dir = root / "meta"
-            meta_dir.mkdir()
-            extras = {"episode_index": 3, "source_episode_path": str(episode_dir)}
-            (meta_dir / "episodes_extras.jsonl").write_text(json.dumps(extras) + "\n", encoding="utf-8")
+            frames = [make_frame(0, 0.0, 100.0), make_frame(1, 100.0, 200.0)]
+            episode_dir, meta = write_episode(raw_root, frames)
+            depth_meta = load_media_meta(episode_dir, "depth")
+            depth_meta.update(
+                {
+                    "storage": "mp4",
+                    "video_encoding": "HueMp4",
+                    "hue_min_meters": 0.0,
+                    "hue_max_meters": 20.0,
+                }
+            )
+            (episode_dir / "depth" / "meta.json").write_text(json.dumps(depth_meta), encoding="utf-8")
+            (episode_dir / "depth" / "front.mp4").touch()
+            body_from_camera = validate_fixed_extrinsics(episode_dir, frames, ["front"], 1e-4, 0.1)
+            episode = UnrealEpisode(
+                episode_dir,
+                meta,
+                frames,
+                ["front"],
+                "",
+                0,
+                [],
+                body_from_camera,
+                load_media_meta(episode_dir, "rgb"),
+                depth_meta,
+            )
 
-            report = copy_depth_sidecars(root, ["front"])
+            encoded_rgb = np.array([[[255, 255, 0]]], dtype=np.uint8)
+            encoded_bgr = encoded_rgb[..., ::-1]
 
-            self.assertEqual(report["status"], "completed")
-            self.assertEqual(report["num_copied_files"], 2)
-            depth_dir = root / "images" / "chunk-000" / "observation.depth.front" / "episode_000003"
+            class FakeCapture:
+                def __init__(self, _path):
+                    self.frames = [encoded_bgr.copy(), encoded_bgr.copy()]
+
+                def isOpened(self):
+                    return True
+
+                def read(self):
+                    if not self.frames:
+                        return False, None
+                    return True, self.frames.pop(0)
+
+                def release(self):
+                    pass
+
+            fake_cv2 = SimpleNamespace(VideoCapture=FakeCapture)
+            with patch.dict(sys.modules, {"cv2": fake_cv2}):
+                prepared = episode.prepare_episode(root / "output")
+            episode.commit_prepared_episode(root / "output", 3, prepared)
+
+            depth_dir = root / "output" / "images" / "chunk-000" / "observation.depth.front" / "episode_000003"
             self.assertTrue((depth_dir / "00000.png").exists())
             self.assertTrue((depth_dir / "00001.png").exists())
+            with Image.open(depth_dir / "00000.png") as image:
+                self.assertEqual(int(np.asarray(image)[0, 0]), 4000)
+            self.assertEqual(episode.depth_decode_stats["front"]["frame_count"], 2)
 
 
 if __name__ == "__main__":

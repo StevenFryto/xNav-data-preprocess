@@ -90,6 +90,7 @@ import csv
 import json
 import logging
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -664,6 +665,7 @@ class UnrealEpisode:
         self.body_from_camera = body_from_camera
         self.rgb_meta = dict(rgb_meta) if rgb_meta is not None else load_media_meta(episode_dir, "rgb")
         self.depth_meta = dict(depth_meta) if depth_meta is not None else load_media_meta(episode_dir, "depth")
+        self.depth_decode_stats: dict[str, Any] = {}
         self.image_sources = {
             camera: CameraImageSource.from_episode(episode_dir, self.rgb_meta, camera, len(frames))
             for camera in camera_keys
@@ -692,6 +694,8 @@ class UnrealEpisode:
             "updated_at": self.meta.get("updated_at", ""),
             "rgb_media_meta": self.rgb_meta,
             "depth_media_meta": self.depth_meta,
+            "depth_output_format": "uint16_mm_png",
+            "depth_decode_stats": self.depth_decode_stats,
         }
         for camera in self.camera_keys:
             video_key = f"video.{camera}"
@@ -700,6 +704,125 @@ class UnrealEpisode:
             metadata[f"K_{camera}"] = intrinsic_matrix(self.frames[0], camera)
             metadata[f"Extrinsic_{camera}"] = self.body_from_camera[camera]
         return metadata
+
+    def prepare_episode(self, output_root: Path) -> dict[str, Any]:
+        storage = str(self.depth_meta.get("storage", "")).strip().lower()
+        encoding = str(self.depth_meta.get("video_encoding", "")).strip().lower()
+        unit = str(self.depth_meta.get("depth_unit", "")).strip().lower()
+        if storage != "mp4" or encoding != "huemp4":
+            raise ValueError(
+                f"Unsupported depth media format for {self.episode_dir}: "
+                f"storage={storage!r} video_encoding={encoding!r}; expected HueMp4"
+            )
+        if unit != "millimeter":
+            raise ValueError(f"Unsupported depth unit {unit!r} in {self.episode_dir / 'depth' / 'meta.json'}")
+
+        min_meters = float(self.depth_meta["hue_min_meters"])
+        max_meters = float(self.depth_meta["hue_max_meters"])
+        staging_parent = Path(output_root) / ".unreal_depth_staging"
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        staging_root = Path(tempfile.mkdtemp(prefix="episode_", dir=staging_parent))
+        prepared: dict[str, Any] = {
+            "staging_root": staging_root,
+            "camera_dirs": {},
+            "committed_dirs": [],
+        }
+        stats: dict[str, Any] = {}
+
+        try:
+            import cv2
+
+            for camera in self.camera_keys:
+                video_path = self.episode_dir / "depth" / f"{camera}.mp4"
+                if not path_exists(video_path):
+                    raise ValueError(f"Missing HueMp4 depth video: {video_path}")
+
+                capture = cv2.VideoCapture(str(video_path))
+                if not capture.isOpened():
+                    capture.release()
+                    raise ValueError(f"Failed to open HueMp4 depth video: {video_path}")
+
+                camera_dir = staging_root / camera
+                camera_dir.mkdir(parents=True)
+                valid_pixels = 0
+                total_pixels = 0
+                min_valid_mm: int | None = None
+                max_valid_mm: int | None = None
+                try:
+                    for frame_index in range(len(self.frames)):
+                        ok, bgr = capture.read()
+                        if not ok:
+                            raise ValueError(
+                                f"Depth video ended early for {self.episode_dir} camera {camera}: "
+                                f"expected {len(self.frames)} frames, got {frame_index}"
+                            )
+                        rgb = bgr[..., ::-1]
+                        depth_mm, valid = decode_hue_depth_rgb(rgb, min_meters, max_meters)
+                        Image.fromarray(depth_mm).save(camera_dir / f"{frame_index:05d}.png")
+                        frame_valid = int(valid.sum())
+                        valid_pixels += frame_valid
+                        total_pixels += int(valid.size)
+                        if frame_valid:
+                            valid_depth = depth_mm[valid]
+                            frame_min = int(valid_depth.min())
+                            frame_max = int(valid_depth.max())
+                            min_valid_mm = frame_min if min_valid_mm is None else min(min_valid_mm, frame_min)
+                            max_valid_mm = frame_max if max_valid_mm is None else max(max_valid_mm, frame_max)
+
+                    ok, _ = capture.read()
+                    if ok:
+                        raise ValueError(
+                            f"Depth video frame count mismatch for {self.episode_dir} camera {camera}: "
+                            f"expected exactly {len(self.frames)} frames, video has more"
+                        )
+                finally:
+                    capture.release()
+
+                prepared["camera_dirs"][camera] = camera_dir
+                stats[camera] = {
+                    "frame_count": len(self.frames),
+                    "valid_pixel_count": valid_pixels,
+                    "total_pixel_count": total_pixels,
+                    "invalid_pixel_ratio": (
+                        float(total_pixels - valid_pixels) / float(total_pixels) if total_pixels else 1.0
+                    ),
+                    "min_valid_depth_mm": min_valid_mm,
+                    "max_valid_depth_mm": max_valid_mm,
+                }
+        except Exception:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
+
+        self.depth_decode_stats = stats
+        return prepared
+
+    def commit_prepared_episode(
+        self,
+        output_root: Path,
+        episode_index: int,
+        prepared: dict[str, Any],
+    ):
+        chunk = int(episode_index) // 1000
+        for camera in self.camera_keys:
+            source_dir = Path(prepared["camera_dirs"][camera])
+            target_dir = (
+                Path(output_root)
+                / "images"
+                / f"chunk-{chunk:03d}"
+                / f"observation.depth.{camera}"
+                / f"episode_{int(episode_index):06d}"
+            )
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            if target_dir.exists():
+                raise FileExistsError(f"Depth sidecar output already exists: {target_dir}")
+            shutil.move(str(source_dir), str(target_dir))
+            prepared["committed_dirs"].append(target_dir)
+        shutil.rmtree(Path(prepared["staging_root"]), ignore_errors=True)
+
+    def discard_prepared_episode(self, prepared: dict[str, Any]):
+        shutil.rmtree(Path(prepared["staging_root"]), ignore_errors=True)
+        for path in prepared.get("committed_dirs", []):
+            shutil.rmtree(Path(path), ignore_errors=True)
 
     def __iter__(self):
         image_iters = {camera: self.image_sources[camera].iter_rgb() for camera in self.camera_keys}
@@ -1159,7 +1282,7 @@ def write_episode_extras_parquet(root: Path) -> dict[str, Any]:
     }
 
 
-def copy_depth_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
+def summarize_depth_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
     extras_path = root / "meta" / "episodes_extras.jsonl"
     extras = load_jsonl_dicts(extras_path)
     report: dict[str, Any] = {
@@ -1167,7 +1290,7 @@ def copy_depth_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
         "source": str(extras_path),
         "output_root": str(root / "images"),
         "num_episodes": len(extras),
-        "num_copied_files": 0,
+        "num_depth_files": 0,
         "missing": [],
     }
     if not extras:
@@ -1176,45 +1299,18 @@ def copy_depth_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
         return report
 
     for item in extras:
-        source_episode_path = item.get("source_episode_path")
         episode_index = item.get("episode_index")
-        if source_episode_path in (None, "") or episode_index is None:
+        if episode_index is None:
             report["missing"].append(
                 {
-                    "source_episode_path": source_episode_path or "",
                     "episode_index": episode_index,
-                    "reason": "missing_source_or_episode_index",
+                    "reason": "missing_episode_index",
                 }
             )
             continue
 
-        episode_dir = Path(str(source_episode_path))
         chunk = int(episode_index) // 1000
         for camera in camera_keys:
-            source_dir = episode_dir / "depth" / camera
-            if not source_dir.exists():
-                report["missing"].append(
-                    {
-                        "source_episode_path": str(episode_dir),
-                        "episode_index": int(episode_index),
-                        "camera": camera,
-                        "reason": "missing_depth_dir",
-                    }
-                )
-                continue
-
-            depth_paths = sorted(source_dir.glob("*.png"))
-            if not depth_paths:
-                report["missing"].append(
-                    {
-                        "source_episode_path": str(episode_dir),
-                        "episode_index": int(episode_index),
-                        "camera": camera,
-                        "reason": "empty_depth_dir",
-                    }
-                )
-                continue
-
             target_dir = (
                 root
                 / "images"
@@ -1222,20 +1318,30 @@ def copy_depth_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
                 / f"observation.depth.{camera}"
                 / f"episode_{int(episode_index):06d}"
             )
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for frame_index, source_path in enumerate(depth_paths):
-                shutil.copy2(source_path, target_dir / f"{frame_index:05d}.png")
-                report["num_copied_files"] += 1
+            expected_frames = int(item.get("frame_count", 0))
+            depth_paths = sorted(target_dir.glob("*.png")) if target_dir.exists() else []
+            if len(depth_paths) != expected_frames:
+                report["missing"].append(
+                    {
+                        "episode_index": int(episode_index),
+                        "camera": camera,
+                        "reason": "depth_frame_count_mismatch",
+                        "expected": expected_frames,
+                        "actual": len(depth_paths),
+                    }
+                )
+                continue
+            report["num_depth_files"] += len(depth_paths)
 
     if report["missing"]:
-        report["status"] = "completed_with_missing_depth"
+        report["status"] = "failed"
     return report
 
 
 def write_scene_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
     return {
         "episodes_extras_parquet": write_episode_extras_parquet(root),
-        "depth_sidecars": copy_depth_sidecars(root, camera_keys),
+        "depth_sidecars": summarize_depth_sidecars(root, camera_keys),
     }
 
 
@@ -1296,7 +1402,16 @@ def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name
             creator.submit_episode(episode)
 
         logging.info("Waiting for worker processes and video encoders to finish")
-        creator.wait()
+        worker_results = creator.wait()
+        for result in worker_results:
+            if result.get("status") == "failed":
+                collection.failed_episodes.append(
+                    {
+                        "source_episode_path": result.get("source_episode_path", ""),
+                        "stage": "episode_worker",
+                        "error": result.get("error", "unknown worker failure"),
+                    }
+                )
         logging.info("Reading written episode metadata from %s", root / "meta" / "episodes_extras.jsonl")
         collection.sync_successful_episodes_from_output(root)
         sidecar_report = write_scene_sidecars(root, collection.camera_keys)
