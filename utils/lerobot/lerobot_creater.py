@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import shutil
+import tempfile
 import time
 import queue # For access to queue.Empty if needed, though mp.Queue handles it.
 import logging
@@ -84,10 +85,11 @@ class WorkerEpisodeBuilder:
         self.has_extras = has_extras
         self.extra_metadata = extra_metadata or {}
         
-        # 1. Allocate Episode ID
-        self.episode_index = self.meta.allocate_episode_index()
-        
-        # 2. Initialize Buffers
+        # Delay episode index allocation until all input frames and optional
+        # sidecars have been prepared successfully.
+        self.episode_index = None
+
+        # 1. Initialize Buffers
         self.buffer = {k: [] for k, v in features.items() if v["dtype"] not in ["image", "video"]}
         self.buffer["frame_index"] = []
         self.buffer["timestamp"] = []
@@ -97,23 +99,22 @@ class WorkerEpisodeBuilder:
         self.image_buffer = {k: [] for k in self.image_keys} 
 
         self.chunk_size = 1000
-        self.chunk = self.episode_index // self.chunk_size
-        
-        # 3. Prepare Temp Directories
+        self.chunk = None
+
+        # 2. Prepare Temp Directories independent of the final episode index.
+        staging_root = self.root / ".lerobot_staging"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        self.staging_dir = Path(tempfile.mkdtemp(prefix="episode_", dir=staging_root))
         self.temp_image_dirs = {}
         for key in self.image_keys:
-             # Use atomic mkdir or ignore exist error
-             p = self.root / "videos" / f"chunk-{self.chunk:03d}" / key / f"episode_{self.episode_index:06d}_temp"
-             try:
-                p.mkdir(parents=True, exist_ok=True)
-             except FileExistsError:
-                pass
+             p = self.staging_dir / key
+             p.mkdir(parents=True, exist_ok=True)
              self.temp_image_dirs[key] = p
              
         self.frame_count = 0
         self.tasks_set = set()
         
-        # 4. Image Writer (Threaded inside this process)
+        # 3. Image Writer (Threaded inside this process)
         # Assuming AsyncImageWriter works locally. 
         # Since we are in a worker process, we create a new thread pool here.
         self.image_writer = AsyncImageWriter(num_threads=4)
@@ -146,9 +147,9 @@ class WorkerEpisodeBuilder:
         self.buffer["timestamp"].append(self.frame_count / self.fps)
         self.frame_count += 1
 
-    def finalize(self):
+    def finalize(self, commit_prepared=None):
         if self.frame_count == 0:
-            return
+            raise ValueError("Cannot finalize an empty episode")
 
         # Ensure all images are written
         self.image_writer.wait_until_done()
@@ -158,6 +159,10 @@ class WorkerEpisodeBuilder:
         # Actually image_writer shutdown handling needs care.
         # Assuming wait_until_done() is sufficient.
         
+        # Allocate only after the entire iterator and its sidecars were prepared.
+        self.episode_index = self.meta.allocate_episode_index()
+        self.chunk = self.episode_index // self.chunk_size
+
         # Resolve Tasks via Metadata Process
         unique_tasks = list(self.tasks_set)
         task_map = {}
@@ -178,6 +183,9 @@ class WorkerEpisodeBuilder:
         
         ds = datasets.Dataset.from_dict(data)
         ds.to_parquet(parquet_path)
+
+        if commit_prepared is not None:
+            commit_prepared(self.episode_index)
         
         # Compute Stats
         if compute_episode_stats:
@@ -218,6 +226,20 @@ class WorkerEpisodeBuilder:
             self.meta.append_episode_extras(self.extra_metadata)
             
         self.meta.update_global_stats(self.frame_count, len(self.image_keys))
+        return self.episode_index
+
+    def cleanup(self, *, remove_staging: bool):
+        self.image_writer.stop()
+        if remove_staging:
+            shutil.rmtree(self.staging_dir, ignore_errors=True)
+            if self.episode_index is not None and self.chunk is not None:
+                parquet_path = (
+                    self.root
+                    / "data"
+                    / f"chunk-{self.chunk:03d}"
+                    / f"episode_{self.episode_index:06d}.parquet"
+                )
+                parquet_path.unlink(missing_ok=True)
 
 
 # --- Service Entry Points ---
@@ -287,13 +309,31 @@ def video_encoder_service(video_queue: mp.JoinableQueue):
                 overwrite=True
             )
             shutil.rmtree(temp_dir, ignore_errors=True)
+            staging_dir = Path(temp_dir).parent
+            try:
+                staging_dir.rmdir()
+            except OSError:
+                pass
         except Exception as e:
             logging.error(f"Video Encoder Failed ({out_path}): {e}")
             traceback.print_exc()
         finally:
             video_queue.task_done()
 
-def worker_service(task_queue: mp.JoinableQueue, meta_req_queue: mp.Queue, resp_queue: mp.Queue, video_queue: mp.JoinableQueue, root: Path, features: Dict, fps: int, rank: int, codec: str = "h264", pix_fmt: str = "yuv420p", has_extras: bool = False):
+def worker_service(
+    task_queue: mp.JoinableQueue,
+    meta_req_queue: mp.Queue,
+    resp_queue: mp.Queue,
+    video_queue: mp.JoinableQueue,
+    result_queue: mp.Queue,
+    root: Path,
+    features: Dict,
+    fps: int,
+    rank: int,
+    codec: str = "h264",
+    pix_fmt: str = "yuv420p",
+    has_extras: bool = False,
+):
     """Entry point for Worker Processes."""
     meta_client = MetadataClient(meta_req_queue, resp_queue, rank)
     
@@ -307,7 +347,14 @@ def worker_service(task_queue: mp.JoinableQueue, meta_req_queue: mp.Queue, resp_
             task_queue.task_done()
             break
             
+        builder = None
+        prepared = None
+        completed = False
+        source = str(getattr(item, "episode_dir", ""))
         try:
+            if hasattr(item, "prepare_episode"):
+                prepared = item.prepare_episode(root)
+
             # Handle incoming task (create iterator)
             extra_metadata = {}
             if callable(item):
@@ -316,7 +363,7 @@ def worker_service(task_queue: mp.JoinableQueue, meta_req_queue: mp.Queue, resp_
                 iterator = item
                 if has_extras and hasattr(item, "metadata"):
                     extra_metadata = item.metadata
-                
+
             builder = WorkerEpisodeBuilder(root, meta_client, features, fps, video_queue, codec=codec, pix_fmt=pix_fmt, has_extras=has_extras, extra_metadata=extra_metadata)
             
             for element in iterator:
@@ -335,12 +382,41 @@ def worker_service(task_queue: mp.JoinableQueue, meta_req_queue: mp.Queue, resp_
                     
                 builder.add_frame(frame, task)
             
-            builder.finalize()
+            commit_prepared = None
+            if prepared is not None and hasattr(item, "commit_prepared_episode"):
+                commit_prepared = lambda episode_index: item.commit_prepared_episode(
+                    root,
+                    episode_index,
+                    prepared,
+                )
+            episode_index = builder.finalize(commit_prepared=commit_prepared)
+            result_queue.put(
+                {
+                    "status": "completed",
+                    "source_episode_path": source,
+                    "episode_index": episode_index,
+                }
+            )
+            completed = True
             
         except Exception as e:
             logging.error(f"Worker Task Failed: {e}")
             traceback.print_exc()
+            if prepared is not None and hasattr(item, "discard_prepared_episode"):
+                try:
+                    item.discard_prepared_episode(prepared)
+                except Exception:
+                    logging.exception("Failed to discard prepared episode sidecars")
+            result_queue.put(
+                {
+                    "status": "failed",
+                    "source_episode_path": source,
+                    "error": str(e),
+                }
+            )
         finally:
+            if builder is not None:
+                builder.cleanup(remove_staging=not completed)
             task_queue.task_done()
 
 
@@ -376,6 +452,8 @@ class LeRobotCreator:
         self.task_queue = mp.JoinableQueue(maxsize=num_workers * 2) 
         self.meta_req_queue = mp.Queue()
         self.video_queue = mp.JoinableQueue()
+        self.result_queue = mp.Queue()
+        self.results = []
         
         # Create dedicated reply queues for each worker
         # and the num_workers + 1 for creator if needed
@@ -408,7 +486,20 @@ class LeRobotCreator:
             # Pass the SPECIFIC reply queue for this worker, and its rank
             p = mp.Process(
                 target=worker_service, 
-                args=(self.task_queue, self.meta_req_queue, self.reply_queues[i], self.video_queue, self.root, features, fps, i, codec, pix_fmt, has_extras),
+                args=(
+                    self.task_queue,
+                    self.meta_req_queue,
+                    self.reply_queues[i],
+                    self.video_queue,
+                    self.result_queue,
+                    self.root,
+                    features,
+                    fps,
+                    i,
+                    codec,
+                    pix_fmt,
+                    has_extras,
+                ),
                 daemon=True
             )
             p.start()
@@ -455,3 +546,10 @@ class LeRobotCreator:
         # 5. Stop Metadata
         self.meta_req_queue.put((CMD_STOP, None, None))
         self.meta_process.join()
+
+        while True:
+            try:
+                self.results.append(self.result_queue.get_nowait())
+            except queue.Empty:
+                break
+        return list(self.results)
