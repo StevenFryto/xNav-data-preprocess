@@ -25,6 +25,7 @@ from unreal import (
     body_from_camera_for_frame,
     build_features,
     copy_depth_sidecars,
+    decode_hue_depth_rgb,
     group_episodes_by_scene,
     group_episodes_by_schema,
     intrinsic_matrix,
@@ -115,6 +116,41 @@ def write_episode(
 
 
 class UnrealConversionTests(unittest.TestCase):
+    def test_decode_hue_depth_rgb_recovers_six_hue_sectors(self):
+        rgb = np.array(
+            [
+                [
+                    [255, 0, 0],
+                    [255, 255, 0],
+                    [0, 255, 0],
+                    [0, 255, 255],
+                    [0, 0, 255],
+                    [255, 0, 255],
+                ]
+            ],
+            dtype=np.uint8,
+        )
+
+        depth, valid = decode_hue_depth_rgb(rgb, 0.0, 20.0)
+
+        np.testing.assert_array_equal(depth[0], np.array([0, 4000, 8000, 12000, 16000, 20000]))
+        self.assertTrue(valid.all())
+
+    def test_decode_hue_depth_rgb_marks_dark_and_gray_pixels_invalid(self):
+        rgb = np.array([[[0, 0, 0], [15, 0, 0], [100, 100, 100], [250, 12, 4]]], dtype=np.uint8)
+
+        depth, valid = decode_hue_depth_rgb(rgb, 0.0, 20.0)
+
+        np.testing.assert_array_equal(valid[0], np.array([False, False, False, True]))
+        np.testing.assert_array_equal(depth[0, :3], np.zeros(3, dtype=np.uint16))
+        self.assertLess(int(depth[0, 3]), 1000)
+
+    def test_decode_hue_depth_rgb_rejects_invalid_inputs(self):
+        with self.assertRaisesRegex(ValueError, "shape"):
+            decode_hue_depth_rgb(np.zeros((2, 2), dtype=np.uint8), 0.0, 20.0)
+        with self.assertRaisesRegex(ValueError, "Invalid hue depth range"):
+            decode_hue_depth_rgb(np.zeros((2, 2, 3), dtype=np.uint8), 20.0, 20.0)
+
     def test_validate_media_meta_recovers_legacy_fields(self):
         with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
             root = Path(tmp)

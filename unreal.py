@@ -106,6 +106,8 @@ STATE_KEY = "observation.state"
 ACTION_KEY = "action"
 POSE_AXES = ["tx", "ty", "tz", "qx", "qy", "qz", "qw"]
 DEFAULT_CAMERA_KEYS = ("front", "rear", "left", "right")
+DEPTH_DARK_THRESHOLD = 16
+DEPTH_SATURATION_THRESHOLD = 16
 
 # UE 录制使用 +X 前、+Y 右、+Z 上；目标机体系要求 +Y 为左，因此只需要翻转 Y 轴。
 UE_TO_TARGET = np.diag([1.0, -1.0, 1.0]).astype(np.float32)
@@ -280,6 +282,60 @@ def select_video_pixel_format(image_size: tuple[int, int], codec: str, pix_fmt: 
         )
         return "yuv444p"
     return "yuv420p"
+
+
+def decode_hue_depth_rgb(
+    rgb: np.ndarray,
+    min_meters: float,
+    max_meters: float,
+    *,
+    dark_threshold: int = DEPTH_DARK_THRESHOLD,
+    saturation_threshold: int = DEPTH_SATURATION_THRESHOLD,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Decode UE HueMp4 RGB pixels into uint16 millimeter depth.
+
+    UE maps valid depth linearly to HSV hue 0..300 degrees with full saturation
+    and value. Invalid depth is black. Lossy H.264 can perturb those ideal
+    colors, so dark or nearly gray pixels are treated as invalid.
+    """
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError(f"Expected RGB image with shape (H, W, 3), got {rgb.shape}")
+    if max_meters <= min_meters:
+        raise ValueError(f"Invalid hue depth range: min={min_meters} max={max_meters}")
+
+    values = rgb.astype(np.float32)
+    red = values[..., 0]
+    green = values[..., 1]
+    blue = values[..., 2]
+    maximum = values.max(axis=2)
+    minimum = values.min(axis=2)
+    delta = maximum - minimum
+    valid = (maximum > float(dark_threshold)) & (delta > float(saturation_threshold))
+
+    safe_delta = np.where(valid, delta, 1.0)
+    hue = np.zeros(maximum.shape, dtype=np.float32)
+    red_max = valid & (red >= green) & (red >= blue)
+    green_max = valid & ~red_max & (green >= blue)
+    blue_max = valid & ~red_max & ~green_max
+
+    hue[red_max] = 60.0 * np.mod(
+        (green[red_max] - blue[red_max]) / safe_delta[red_max],
+        6.0,
+    )
+    hue[green_max] = 60.0 * (
+        (blue[green_max] - red[green_max]) / safe_delta[green_max] + 2.0
+    )
+    hue[blue_max] = 60.0 * (
+        (red[blue_max] - green[blue_max]) / safe_delta[blue_max] + 4.0
+    )
+    hue = np.clip(hue, 0.0, 300.0)
+
+    depth_meters = float(min_meters) + hue / 300.0 * (float(max_meters) - float(min_meters))
+    depth_mm_float = np.clip(depth_meters * 1000.0, 0.0, float(np.iinfo(np.uint16).max))
+    depth_mm = np.rint(depth_mm_float).astype(np.uint16)
+    depth_mm[~valid] = 0
+    return depth_mm, valid
 
 
 def homogeneous_inv(transform: np.ndarray) -> np.ndarray:
