@@ -445,6 +445,30 @@ class UnrealConversionTests(unittest.TestCase):
             by_schema = group_episodes_by_schema(collection.schema_valid_episodes)
             self.assertEqual(set(by_schema), {(10, (3, 4)), (30, (6, 8))})
 
+    def test_for_episodes_keeps_matching_repairs_and_warnings(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
+            root = Path(tmp)
+            episode_dir, _ = write_episode(root, [make_frame(0, 0.0, 100.0)])
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+            )
+            collection.repaired_episodes.append(
+                {"source_episode_path": str(episode_dir), "action": "repair"}
+            )
+            collection.warnings.append(
+                {"source_episode_path": str(episode_dir), "warning": "warning"}
+            )
+
+            grouped = collection.for_episodes(collection.episodes)
+
+            self.assertEqual(grouped.repaired_episodes[-1]["action"], "repair")
+            self.assertEqual(grouped.warnings[-1]["warning"], "warning")
+
     def test_collection_can_trim_one_extra_tail_frame(self):
         with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
             root = Path(tmp)

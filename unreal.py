@@ -1237,6 +1237,7 @@ class UnrealEpisodeCollection:
         *,
         target_schema: tuple[int, tuple[int, int]] | None = None,
     ) -> "UnrealEpisodeCollection":
+        source_paths = {str(episode[0]) for episode in episodes}
         return UnrealEpisodeCollection(
             raw_dir=self.raw_dir,
             camera_keys=self.camera_keys,
@@ -1248,9 +1249,17 @@ class UnrealEpisodeCollection:
             trim_extra_tail_frame=self.trim_extra_tail_frame,
             initial_episodes=episodes,
             initial_failures=[],
-            initial_repairs=[],
+            initial_repairs=[
+                item
+                for item in self.repaired_episodes
+                if item.get("source_episode_path") in source_paths
+            ],
             initial_exclusions=[],
-            initial_warnings=[],
+            initial_warnings=[
+                item
+                for item in self.warnings
+                if item.get("source_episode_path") in source_paths
+            ],
         )
 
     def __len__(self) -> int:
