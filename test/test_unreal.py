@@ -33,6 +33,7 @@ from unreal import (
     intrinsic_matrix,
     intrinsic_4,
     load_media_meta,
+    resolve_frame_tasks,
     scan_episode_dirs,
     validate_media_meta,
     validate_fixed_extrinsics,
@@ -118,6 +119,42 @@ def write_episode(
 
 
 class UnrealConversionTests(unittest.TestCase):
+    def test_resolve_frame_tasks_maps_multiple_segments(self):
+        tasks, status = resolve_frame_tasks(
+            [
+                {"start_frame": 0, "end_frame": 2, "name": "first"},
+                {"start_frame": 2, "end_frame": 4, "name": "second"},
+            ],
+            frame_count=5,
+            fallback_task="first",
+        )
+
+        self.assertEqual(tasks, ["first", "first", "second", "second", "second"])
+        self.assertEqual(status["status"], "mapped")
+
+    def test_resolve_frame_tasks_keeps_blank_segment_name(self):
+        tasks, status = resolve_frame_tasks(
+            [
+                {"start_frame": 0, "end_frame": 1, "name": "first"},
+                {"start_frame": 1, "end_frame": 2, "name": ""},
+            ],
+            frame_count=3,
+            fallback_task="first",
+        )
+
+        self.assertEqual(tasks, ["first", "", ""])
+        self.assertEqual(status["status"], "mapped")
+
+    def test_resolve_frame_tasks_falls_back_on_invalid_bounds(self):
+        tasks, status = resolve_frame_tasks(
+            [{"start_frame": 0, "end_frame": 99, "name": "first"}],
+            frame_count=3,
+            fallback_task="first",
+        )
+
+        self.assertEqual(tasks, ["first", "first", "first"])
+        self.assertEqual(status["status"], "fallback")
+
     def test_decode_hue_depth_rgb_recovers_six_hue_sectors(self):
         rgb = np.array(
             [

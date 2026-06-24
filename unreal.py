@@ -453,7 +453,7 @@ def validate_fixed_extrinsics(
 
 
 def load_task_info(episode_dir: Path) -> tuple[str, list[dict[str, Any]]]:
-    """读取 UE 写出的子任务分段；LeRobot 当前只使用第一个非空 name 作为整段 task。"""
+    """Read UE subtask segments and return the first non-empty fallback task."""
     path = episode_dir / "task_info.csv"
     if not path.exists():
         return "", []
@@ -475,6 +475,54 @@ def load_task_info(episode_dir: Path) -> tuple[str, list[dict[str, Any]]]:
 
     task = next((str(row.get("name", "")).strip() for row in rows if str(row.get("name", "")).strip()), "")
     return task, rows
+
+
+def resolve_frame_tasks(
+    task_info: list[dict[str, Any]],
+    frame_count: int,
+    fallback_task: str,
+) -> tuple[list[str], dict[str, Any]]:
+    if frame_count <= 0:
+        raise ValueError("frame_count must be positive")
+    if not task_info:
+        return [fallback_task] * frame_count, {"status": "no_task_info"}
+
+    try:
+        starts = [int(row["start_frame"]) for row in task_info]
+        ends = [int(row["end_frame"]) for row in task_info]
+        if starts[0] != 0:
+            raise ValueError(f"first start_frame must be 0, got {starts[0]}")
+        if any(current <= previous for previous, current in zip(starts, starts[1:])):
+            raise ValueError(f"start_frame values must be strictly increasing: {starts}")
+        for index in range(len(task_info) - 1):
+            if ends[index] != starts[index + 1]:
+                raise ValueError(
+                    f"segment {index} end_frame={ends[index]} does not match "
+                    f"next start_frame={starts[index + 1]}"
+                )
+        if ends[-1] != frame_count - 1:
+            raise ValueError(
+                f"last end_frame must equal final frame index {frame_count - 1}, got {ends[-1]}"
+            )
+
+        tasks = [""] * frame_count
+        for index, row in enumerate(task_info):
+            start = starts[index]
+            stop = starts[index + 1] if index + 1 < len(starts) else ends[index] + 1
+            if start < 0 or stop > frame_count or stop <= start:
+                raise ValueError(f"invalid segment bounds [{start}, {stop})")
+            name = str(row.get("name", "")).strip()
+            tasks[start:stop] = [name] * (stop - start)
+        return tasks, {"status": "mapped", "num_segments": len(task_info)}
+    except (KeyError, TypeError, ValueError) as exc:
+        return (
+            [fallback_task] * frame_count,
+            {
+                "status": "fallback",
+                "reason": str(exc),
+                "fallback_task": fallback_task,
+            },
+        )
 
 
 def infer_source_ids(episode_dir: Path) -> tuple[str, str]:
@@ -654,6 +702,9 @@ class UnrealEpisode:
         body_from_camera: dict[str, np.ndarray],
         rgb_meta: dict[str, Any] | None = None,
         depth_meta: dict[str, Any] | None = None,
+        frame_tasks: list[str] | None = None,
+        task_indices: dict[str, int] | None = None,
+        task_mapping: dict[str, Any] | None = None,
     ):
         self.episode_dir = episode_dir
         self.meta = meta
@@ -666,6 +717,13 @@ class UnrealEpisode:
         self.rgb_meta = dict(rgb_meta) if rgb_meta is not None else load_media_meta(episode_dir, "rgb")
         self.depth_meta = dict(depth_meta) if depth_meta is not None else load_media_meta(episode_dir, "depth")
         self.depth_decode_stats: dict[str, Any] = {}
+        self.frame_tasks = list(frame_tasks) if frame_tasks is not None else [task] * len(frames)
+        self.task_indices = dict(task_indices or {task: task_idx})
+        self.task_mapping = dict(task_mapping or {"status": "legacy_single_task"})
+        if len(self.frame_tasks) != len(self.frames):
+            raise ValueError(
+                f"frame task count mismatch: frames={len(self.frames)} tasks={len(self.frame_tasks)}"
+            )
         self.image_sources = {
             camera: CameraImageSource.from_episode(episode_dir, self.rgb_meta, camera, len(frames))
             for camera in camera_keys
@@ -690,6 +748,7 @@ class UnrealEpisode:
             "camera_keys": self.camera_keys,
             "task": self.task,
             "task_info": self.task_info,
+            "task_mapping": self.task_mapping,
             "created_at": self.meta.get("created_at", ""),
             "updated_at": self.meta.get("updated_at", ""),
             "rgb_media_meta": self.rgb_meta,
@@ -828,21 +887,22 @@ class UnrealEpisode:
         image_iters = {camera: self.image_sources[camera].iter_rgb() for camera in self.camera_keys}
         first_body_inv: np.ndarray | None = None
 
-        for frame in self.frames:
+        for frame_index, frame in enumerate(self.frames):
             world_from_body = unreal_pose_to_target_transform(frame["pose"])
             if first_body_inv is None:
                 # 按数据规范，trajectory 的 world 取第一帧机体坐标系。
                 first_body_inv = homogeneous_inv(world_from_body)
             local_pose = transform_to_pose_vector((first_body_inv @ world_from_body).astype(np.float32))
 
+            frame_task = self.frame_tasks[frame_index]
             item: dict[str, Any] = {
-                TASK_DESCRIPTION_KEY: np.array([self.task_idx], dtype=np.int32),
+                TASK_DESCRIPTION_KEY: np.array([self.task_indices[frame_task]], dtype=np.int32),
                 STATE_KEY: local_pose,
                 ACTION_KEY: local_pose.copy(),
             }
             for camera in self.camera_keys:
                 item[f"video.{camera}"] = next(image_iters[camera])
-            yield item, self.task
+            yield item, frame_task
 
 
 class UnrealEpisodeCollection:
@@ -1128,7 +1188,22 @@ class UnrealEpisodeCollection:
     def __iter__(self):
         for episode in self.episodes:
             episode_dir, meta, frames, task, task_info, body_from_camera, rgb_meta, depth_meta = episode
-            task_idx = self.get_task_idx(task)
+            frame_tasks, task_mapping = resolve_frame_tasks(task_info, len(frames), task)
+            task_indices = {
+                frame_task: self.get_task_idx(frame_task)
+                for frame_task in dict.fromkeys(frame_tasks)
+            }
+            task_idx = task_indices.get(task, next(iter(task_indices.values())))
+            if task_mapping.get("status") == "fallback":
+                self.repaired_episodes.append(
+                    {
+                        "source_episode_path": str(episode_dir),
+                        "stage": "task_mapping",
+                        "action": "fallback_to_first_non_empty_task",
+                        "reason": task_mapping.get("reason", ""),
+                        "task": task,
+                    }
+                )
             try:
                 episode = UnrealEpisode(
                     episode_dir,
@@ -1141,6 +1216,9 @@ class UnrealEpisodeCollection:
                     body_from_camera,
                     rgb_meta,
                     depth_meta,
+                    frame_tasks,
+                    task_indices,
+                    task_mapping,
                 )
             except Exception as exc:
                 self._record_failure(episode_dir, "episode_prepare", exc)
