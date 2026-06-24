@@ -29,7 +29,9 @@ from unreal import (
     group_episodes_by_schema,
     intrinsic_matrix,
     intrinsic_4,
+    load_media_meta,
     scan_episode_dirs,
+    validate_media_meta,
     validate_fixed_extrinsics,
     write_episode_extras_parquet,
 )
@@ -64,6 +66,8 @@ def write_episode(
     (episode_dir / "rgb" / "front").mkdir(parents=True)
     if write_depth:
         (episode_dir / "depth" / "front").mkdir(parents=True)
+    else:
+        (episode_dir / "depth").mkdir(parents=True)
 
     meta = {
         "status": "completed",
@@ -77,6 +81,25 @@ def write_episode(
         "camera_names": ["front"],
     }
     (episode_dir / "episode_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    rgb_meta = {
+        "capture_width": width,
+        "capture_height": height,
+        "frame_rate_hz": fps,
+        "camera_names": ["front"],
+        "storage": "png_sequence",
+        "encode_video_directly": False,
+    }
+    depth_meta = {
+        "capture_width": width,
+        "capture_height": height,
+        "frame_rate_hz": fps,
+        "camera_names": ["front"],
+        "storage": "png_sequence",
+        "video_encoding": "PngSequence",
+        "depth_unit": "millimeter",
+    }
+    (episode_dir / "rgb" / "meta.json").write_text(json.dumps(rgb_meta), encoding="utf-8")
+    (episode_dir / "depth" / "meta.json").write_text(json.dumps(depth_meta), encoding="utf-8")
     with (episode_dir / "frames.jsonl").open("w", encoding="utf-8") as file:
         for frame in frames:
             file.write(json.dumps(frame) + "\n")
@@ -92,6 +115,39 @@ def write_episode(
 
 
 class UnrealConversionTests(unittest.TestCase):
+    def test_validate_media_meta_recovers_legacy_fields(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
+            root = Path(tmp)
+            episode_dir, meta = write_episode(root, [make_frame(0, 0.0, 100.0)])
+            meta.pop("scene_id")
+            meta["camera_names"] = []
+
+            recovered, repairs = validate_media_meta(
+                episode_dir,
+                meta,
+                load_media_meta(episode_dir, "rgb"),
+                load_media_meta(episode_dir, "depth"),
+            )
+
+            self.assertEqual(recovered["scene_id"], "scene_0001")
+            self.assertEqual(recovered["camera_names"], ["front"])
+            self.assertEqual({item["field"] for item in repairs}, {"scene_id", "camera_names"})
+
+    def test_validate_media_meta_rejects_camera_conflict(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
+            root = Path(tmp)
+            episode_dir, meta = write_episode(root, [make_frame(0, 0.0, 100.0)])
+            depth_meta = load_media_meta(episode_dir, "depth")
+            depth_meta["camera_names"] = ["rear"]
+
+            with self.assertRaisesRegex(ValueError, "RGB/Depth camera_names mismatch"):
+                validate_media_meta(
+                    episode_dir,
+                    meta,
+                    load_media_meta(episode_dir, "rgb"),
+                    depth_meta,
+                )
+
     def test_scan_episode_dirs_accepts_root_and_episode_dir(self):
         with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
             root = Path(tmp)
@@ -184,6 +240,32 @@ class UnrealConversionTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (invalid_dir / "rgb").mkdir()
+            (invalid_dir / "depth").mkdir()
+            (invalid_dir / "rgb" / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "capture_width": 4,
+                        "capture_height": 3,
+                        "frame_rate_hz": 10,
+                        "camera_names": ["front"],
+                        "storage": "png_sequence",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (invalid_dir / "depth" / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "capture_width": 4,
+                        "capture_height": 3,
+                        "frame_rate_hz": 10,
+                        "camera_names": ["rear"],
+                        "storage": "png_sequence",
+                    }
+                ),
+                encoding="utf-8",
+            )
             (invalid_dir / "frames.jsonl").write_text(json.dumps(make_frame(0, 0.0, 100.0)) + "\n", encoding="utf-8")
 
             collection = UnrealEpisodeCollection(
@@ -197,7 +279,7 @@ class UnrealConversionTests(unittest.TestCase):
 
             self.assertEqual(len(collection), 1)
             self.assertEqual(len(collection.failed_episodes), 1)
-            self.assertIn("missing cameras", collection.failed_episodes[0]["error"])
+            self.assertIn("RGB/Depth camera_names mismatch", collection.failed_episodes[0]["error"])
 
     def test_collection_can_split_mixed_schemas(self):
         with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:

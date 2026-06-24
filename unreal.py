@@ -157,7 +157,7 @@ def parse_args():
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as file:
+    with path.open("r", encoding="utf-8-sig") as file:
         return json.load(file)
 
 
@@ -426,6 +426,81 @@ def infer_source_ids(episode_dir: Path) -> tuple[str, str]:
     return scene_id, user_id
 
 
+def load_media_meta(episode_dir: Path, modality: str) -> dict[str, Any]:
+    path = episode_dir / modality / "meta.json"
+    if not path.exists():
+        raise ValueError(f"missing {modality}/meta.json")
+    meta = load_json(path)
+    if not isinstance(meta, dict):
+        raise ValueError(f"{modality}/meta.json must contain a JSON object")
+    return meta
+
+
+def validate_media_meta(
+    episode_dir: Path,
+    episode_meta: dict[str, Any],
+    rgb_meta: dict[str, Any],
+    depth_meta: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Recover legacy episode fields and cross-check the two media manifests."""
+    recovered = dict(episode_meta)
+    repairs: list[dict[str, Any]] = []
+    source_scene_id, _ = infer_source_ids(episode_dir)
+    if not str(recovered.get("scene_id", "")).strip():
+        recovered["scene_id"] = source_scene_id
+        repairs.append(
+            {
+                "field": "scene_id",
+                "action": "recovered_from_directory",
+                "value": source_scene_id,
+            }
+        )
+
+    rgb_cameras = tuple(str(item) for item in (rgb_meta.get("camera_names") or []))
+    depth_cameras = tuple(str(item) for item in (depth_meta.get("camera_names") or []))
+    if not rgb_cameras or not depth_cameras:
+        raise ValueError("rgb/depth media metadata must declare camera_names")
+    if set(rgb_cameras) != set(depth_cameras):
+        raise ValueError(
+            f"RGB/Depth camera_names mismatch: rgb={list(rgb_cameras)} depth={list(depth_cameras)}"
+        )
+
+    declared_cameras = tuple(str(item) for item in (recovered.get("camera_names") or []))
+    if not declared_cameras:
+        recovered["camera_names"] = list(rgb_cameras)
+        repairs.append(
+            {
+                "field": "camera_names",
+                "action": "recovered_from_media_metadata",
+                "value": list(rgb_cameras),
+            }
+        )
+    elif set(declared_cameras) != set(rgb_cameras):
+        raise ValueError(
+            f"episode/media camera_names mismatch: episode={list(declared_cameras)} "
+            f"media={list(rgb_cameras)}"
+        )
+
+    expected_width = int(recovered["capture_width"])
+    expected_height = int(recovered["capture_height"])
+    expected_fps = float(recovered["sample_rate_hz"])
+    for modality, media_meta in (("rgb", rgb_meta), ("depth", depth_meta)):
+        width = int(media_meta.get("capture_width", -1))
+        height = int(media_meta.get("capture_height", -1))
+        fps = float(media_meta.get("frame_rate_hz", -1))
+        if (width, height) != (expected_width, expected_height):
+            raise ValueError(
+                f"{modality}/meta.json resolution mismatch: "
+                f"episode={expected_width}x{expected_height} media={width}x{height}"
+            )
+        if not np.isclose(fps, expected_fps, rtol=0.0, atol=1e-6):
+            raise ValueError(
+                f"{modality}/meta.json frame rate mismatch: episode={expected_fps} media={fps}"
+            )
+
+    return recovered, repairs
+
+
 @dataclass
 class CameraImageSource:
     video_path: Path | None
@@ -433,43 +508,58 @@ class CameraImageSource:
     frame_count: int
 
     @classmethod
-    def from_episode(cls, episode_dir: Path, meta: dict[str, Any], camera_key: str, frame_count: int) -> "CameraImageSource":
-        # 优先使用 episode_meta 中记录的视频路径；路径失效时回退到 episode 内的相对 mp4/PNG 序列。
-        video_path: Path | None = None
-        rgb_video_paths = meta.get("rgb_video_paths") or {}
-        video_candidates = []
-        if camera_key in rgb_video_paths:
-            video_candidates.append(Path(rgb_video_paths[camera_key]))
-        video_candidates.append(episode_dir / "rgb" / f"{camera_key}.mp4")
+    def from_episode(
+        cls,
+        episode_dir: Path,
+        rgb_meta: dict[str, Any],
+        camera_key: str,
+        frame_count: int,
+    ) -> "CameraImageSource":
+        storage = str(rgb_meta.get("storage", "")).strip().lower()
+        video_path = episode_dir / "rgb" / f"{camera_key}.mp4"
+        image_dir = episode_dir / "rgb" / camera_key
+        image_paths = sorted(image_dir.glob("*.png")) if image_dir.is_dir() else []
 
-        for candidate in video_candidates:
-            if path_exists(candidate):
-                import cv2
+        if storage == "mp4":
+            if image_paths:
+                logging.warning(
+                    "Ignoring %d undeclared RGB PNG files because rgb/meta.json selects mp4: %s camera=%s",
+                    len(image_paths),
+                    episode_dir,
+                    camera_key,
+                )
+            if not path_exists(video_path):
+                raise ValueError(f"Missing RGB MP4 selected by rgb/meta.json: {video_path}")
+            import cv2
 
-                video_path = candidate
-                capture = cv2.VideoCapture(str(video_path))
-                try:
-                    encoded_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) if capture.isOpened() else 0
-                finally:
-                    capture.release()
-                if encoded_count > 0 and encoded_count != frame_count:
-                    raise ValueError(
-                        f"RGB video frame count mismatch for {episode_dir} camera {camera_key}: "
-                        f"expected {frame_count}, got {encoded_count}"
-                    )
-                break
-
-        if video_path is not None:
+            capture = cv2.VideoCapture(str(video_path))
+            try:
+                if not capture.isOpened():
+                    raise ValueError(f"Failed to open RGB video: {video_path}")
+                encoded_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            finally:
+                capture.release()
+            if encoded_count > 0 and encoded_count != frame_count:
+                raise ValueError(
+                    f"RGB video frame count mismatch for {episode_dir} camera {camera_key}: "
+                    f"expected {frame_count}, got {encoded_count}"
+                )
             return cls(video_path=video_path, image_paths=None, frame_count=frame_count)
 
-        image_dir = episode_dir / "rgb" / camera_key
-        image_paths = sorted(image_dir.glob("*.png"))
-        if len(image_paths) != frame_count:
-            raise ValueError(
-                f"RGB frame count mismatch for {episode_dir} camera {camera_key}: "
-                f"expected {frame_count}, got {len(image_paths)}"
-            )
-        return cls(video_path=None, image_paths=image_paths, frame_count=frame_count)
+        if storage == "png_sequence":
+            if path_exists(video_path):
+                logging.warning(
+                    "Ignoring undeclared RGB MP4 because rgb/meta.json selects png_sequence: %s",
+                    video_path,
+                )
+            if len(image_paths) != frame_count:
+                raise ValueError(
+                    f"RGB frame count mismatch for {episode_dir} camera {camera_key}: "
+                    f"expected {frame_count}, got {len(image_paths)}"
+                )
+            return cls(video_path=None, image_paths=image_paths, frame_count=frame_count)
+
+        raise ValueError(f"Unsupported RGB storage {storage!r} in {episode_dir / 'rgb' / 'meta.json'}")
 
     def iter_rgb(self):
         if self.video_path is not None:
@@ -505,6 +595,8 @@ class UnrealEpisode:
         task_idx: int,
         task_info: list[dict[str, Any]],
         body_from_camera: dict[str, np.ndarray],
+        rgb_meta: dict[str, Any] | None = None,
+        depth_meta: dict[str, Any] | None = None,
     ):
         self.episode_dir = episode_dir
         self.meta = meta
@@ -514,8 +606,10 @@ class UnrealEpisode:
         self.task_idx = task_idx
         self.task_info = task_info
         self.body_from_camera = body_from_camera
+        self.rgb_meta = dict(rgb_meta) if rgb_meta is not None else load_media_meta(episode_dir, "rgb")
+        self.depth_meta = dict(depth_meta) if depth_meta is not None else load_media_meta(episode_dir, "depth")
         self.image_sources = {
-            camera: CameraImageSource.from_episode(episode_dir, meta, camera, len(frames))
+            camera: CameraImageSource.from_episode(episode_dir, self.rgb_meta, camera, len(frames))
             for camera in camera_keys
         }
 
@@ -538,6 +632,10 @@ class UnrealEpisode:
             "camera_keys": self.camera_keys,
             "task": self.task,
             "task_info": self.task_info,
+            "created_at": self.meta.get("created_at", ""),
+            "updated_at": self.meta.get("updated_at", ""),
+            "rgb_media_meta": self.rgb_meta,
+            "depth_media_meta": self.depth_meta,
         }
         for camera in self.camera_keys:
             video_key = f"video.{camera}"
@@ -616,10 +714,10 @@ class UnrealEpisodeCollection:
 
         schema_candidates: list[tuple[tuple[int, tuple[int, int]], tuple]] = []
         for episode in self.episodes:
-            episode_dir, meta, frames, _, _, _ = episode
+            episode_dir, meta, frames = episode[:3]
             try:
                 frames = self._repair_frames_if_needed(episode_dir, meta, frames)
-                episode = (episode_dir, meta, frames, episode[3], episode[4], episode[5])
+                episode = (episode_dir, meta, frames, *episode[3:])
                 schema_candidates.append((episode_schema(meta), episode))
             except Exception as exc:
                 self._record_failure(episode_dir, "schema_validation", exc)
@@ -692,6 +790,24 @@ class UnrealEpisodeCollection:
                     logging.info("Skipping non-completed episode at %s: %s", episode_dir, reason)
                     continue
 
+                rgb_meta = load_media_meta(episode_dir, "rgb")
+                depth_meta = load_media_meta(episode_dir, "depth")
+                meta, metadata_repairs = validate_media_meta(
+                    episode_dir,
+                    meta,
+                    rgb_meta,
+                    depth_meta,
+                )
+                if metadata_repairs:
+                    self.repaired_episodes.append(
+                        {
+                            "source_episode_path": str(episode_dir),
+                            "stage": "metadata_recovery",
+                            "action": "recovered_legacy_metadata",
+                            "repairs": metadata_repairs,
+                        }
+                    )
+
                 missing = [camera for camera in self.camera_keys if camera not in (meta.get("camera_names") or [])]
                 if missing:
                     raise ValueError(f"missing cameras in episode_meta.json: {missing}")
@@ -711,7 +827,18 @@ class UnrealEpisodeCollection:
                     self.translation_tolerance_m,
                     self.rotation_tolerance_deg,
                 )
-                loaded.append((episode_dir, meta, frames, task, task_info, body_from_camera))
+                loaded.append(
+                    (
+                        episode_dir,
+                        meta,
+                        frames,
+                        task,
+                        task_info,
+                        body_from_camera,
+                        rgb_meta,
+                        depth_meta,
+                    )
+                )
                 logging.info("Accepted episode %s with %d frames", episode_dir, len(frames))
             except Exception as exc:
                 self._record_failure(episode_dir, "episode_scan", exc)
@@ -820,10 +947,22 @@ class UnrealEpisodeCollection:
         return len(self.episodes)
 
     def __iter__(self):
-        for episode_dir, meta, frames, task, task_info, body_from_camera in self.episodes:
+        for episode in self.episodes:
+            episode_dir, meta, frames, task, task_info, body_from_camera, rgb_meta, depth_meta = episode
             task_idx = self.get_task_idx(task)
             try:
-                episode = UnrealEpisode(episode_dir, meta, frames, self.camera_keys, task, task_idx, task_info, body_from_camera)
+                episode = UnrealEpisode(
+                    episode_dir,
+                    meta,
+                    frames,
+                    self.camera_keys,
+                    task,
+                    task_idx,
+                    task_info,
+                    body_from_camera,
+                    rgb_meta,
+                    depth_meta,
+                )
             except Exception as exc:
                 self._record_failure(episode_dir, "episode_prepare", exc)
                 continue
