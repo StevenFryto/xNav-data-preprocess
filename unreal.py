@@ -9,7 +9,10 @@ from __future__ import annotations
         --camera_keys front,rear,left,right ^
         --num_processes 1 ^
         --skip_invalid_episodes ^
-        --trim_extra_tail_frame
+        --trim_extra_tail_frame ^
+    --resume ^
+    --skip_depth ^
+    --copy_rgb_mp4
 
 `--raw_dir` 可传三种层级：
     1. UE OutputRoot，例如 C:/Data/Saved
@@ -48,6 +51,13 @@ from __future__ import annotations
 `--trim_extra_tail_frame`。脚本只会在最后一行 frame_index 正好等于 frame_count 时，
 在内存中裁掉最后一行，不会修改原始 episode 文件。
 
+如果长任务中断，可加 `--resume` 跳过已完成的 schema/scene 输出。遇到半成品 scene
+时默认报错；确认可重建该 scene 时再加 `--overwrite_incomplete` 移走半成品并重跑。
+`--resume` 会在扫描结束后写出 `output_dir/unreal_scan_cache.pkl`；之后可加
+`--reuse_scan_cache` 直接复用扫描结果，跳过逐 episode 外参校验。
+如果 RGB 源数据本身是帧数匹配的 MP4，可加 `--copy_rgb_mp4` 直接复制到 LeRobot
+视频目录，避免解码和重新编码；需要裁掉额外尾帧的 episode 会自动回退到重编码。
+
 输入 episode 需要包含：
     episode_meta.json
     frames.jsonl
@@ -64,8 +74,8 @@ from __future__ import annotations
 scene 目录下还会额外写出：
     episodes_extras.parquet  # 每条 episode 一行，含 K_<camera>、Extrinsic_<camera> 等
     images/chunk-000/observation.depth.<camera>/episode_*/00000.png
-        # 从 depth/<camera>.mp4 的 HueMp4 编码恢复为 uint16 毫米深度；
-        # 四路 depth 是必需模态，缺失或帧数不一致会跳过整个 episode。
+        # 默认从 depth/<camera>.mp4 的 HueMp4 编码恢复为 uint16 毫米深度；
+        # 加 `--skip_depth` 时不读取、不校验、不导出 depth sidecar。
 
 每帧 parquet 字段：
     annotation.human.action.task_description
@@ -89,6 +99,7 @@ import argparse
 import csv
 import json
 import logging
+import pickle
 import shutil
 import tempfile
 import time
@@ -109,6 +120,7 @@ POSE_AXES = ["tx", "ty", "tz", "qx", "qy", "qz", "qw"]
 DEFAULT_CAMERA_KEYS = ("front", "rear", "left", "right")
 DEPTH_DARK_THRESHOLD = 16
 DEPTH_SATURATION_THRESHOLD = 16
+SCAN_CACHE_VERSION = 1
 
 # UE 录制使用 +X 前、+Y 右、+Z 上；目标机体系要求 +Y 为左，因此只需要翻转 Y 轴。
 UE_TO_TARGET = np.diag([1.0, -1.0, 1.0]).astype(np.float32)
@@ -155,6 +167,48 @@ def parse_args():
         "--trim_extra_tail_frame",
         action="store_true",
         help="Trim one extra tail frame from frames.jsonl when it is exactly meta.frame_count + 1.",
+    )
+    parser.add_argument(
+        "--skip_depth",
+        action="store_true",
+        help="Do not validate, decode, or export depth sidecar images.",
+    )
+    parser.add_argument(
+        "--copy_rgb_mp4",
+        action="store_true",
+        help="Directly copy compatible source RGB MP4 files instead of decoding and re-encoding them.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip scene outputs that already completed successfully.",
+    )
+    parser.add_argument(
+        "--overwrite_incomplete",
+        action="store_true",
+        help="With --resume, move incomplete scene outputs aside and rebuild instead of failing.",
+    )
+    parser.add_argument(
+        "--scan_cache",
+        type=str,
+        default=None,
+        help="Path to a pickle scan cache. Defaults to output_dir/unreal_scan_cache.pkl for --resume/--reuse_scan_cache.",
+    )
+    parser.add_argument(
+        "--reuse_scan_cache",
+        action="store_true",
+        help="Load episode scan results from --scan_cache and skip per-episode validation.",
+    )
+    parser.add_argument(
+        "--log_interval_seconds",
+        type=float,
+        default=30.0,
+        help="Seconds between periodic scan/conversion progress log lines.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable per-episode debug logs.",
     )
     return parser.parse_args()
 
@@ -545,7 +599,7 @@ def validate_media_meta(
     episode_dir: Path,
     episode_meta: dict[str, Any],
     rgb_meta: dict[str, Any],
-    depth_meta: dict[str, Any],
+    depth_meta: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Recover legacy episode fields and cross-check the two media manifests."""
     recovered = dict(episode_meta)
@@ -562,13 +616,16 @@ def validate_media_meta(
         )
 
     rgb_cameras = tuple(str(item) for item in (rgb_meta.get("camera_names") or []))
-    depth_cameras = tuple(str(item) for item in (depth_meta.get("camera_names") or []))
-    if not rgb_cameras or not depth_cameras:
-        raise ValueError("rgb/depth media metadata must declare camera_names")
-    if set(rgb_cameras) != set(depth_cameras):
-        raise ValueError(
-            f"RGB/Depth camera_names mismatch: rgb={list(rgb_cameras)} depth={list(depth_cameras)}"
-        )
+    if not rgb_cameras:
+        raise ValueError("rgb media metadata must declare camera_names")
+    if depth_meta is not None:
+        depth_cameras = tuple(str(item) for item in (depth_meta.get("camera_names") or []))
+        if not depth_cameras:
+            raise ValueError("depth media metadata must declare camera_names")
+        if set(rgb_cameras) != set(depth_cameras):
+            raise ValueError(
+                f"RGB/Depth camera_names mismatch: rgb={list(rgb_cameras)} depth={list(depth_cameras)}"
+            )
 
     declared_cameras = tuple(str(item) for item in (recovered.get("camera_names") or []))
     if not declared_cameras:
@@ -589,7 +646,10 @@ def validate_media_meta(
     expected_width = int(recovered["capture_width"])
     expected_height = int(recovered["capture_height"])
     expected_fps = float(recovered["sample_rate_hz"])
-    for modality, media_meta in (("rgb", rgb_meta), ("depth", depth_meta)):
+    media_metas: list[tuple[str, dict[str, Any]]] = [("rgb", rgb_meta)]
+    if depth_meta is not None:
+        media_metas.append(("depth", depth_meta))
+    for modality, media_meta in media_metas:
         width = int(media_meta.get("capture_width", -1))
         height = int(media_meta.get("capture_height", -1))
         fps = float(media_meta.get("frame_rate_hz", -1))
@@ -744,6 +804,8 @@ class UnrealEpisode:
         frame_tasks: list[str] | None = None,
         task_indices: dict[str, int] | None = None,
         task_mapping: dict[str, Any] | None = None,
+        export_depth: bool = True,
+        copy_rgb_mp4: bool = False,
     ):
         self.episode_dir = episode_dir
         self.meta = meta
@@ -754,12 +816,19 @@ class UnrealEpisode:
         self.task_info = task_info
         self.body_from_camera = body_from_camera
         self.rgb_meta = dict(rgb_meta) if rgb_meta is not None else load_media_meta(episode_dir, "rgb")
-        self.depth_meta = dict(depth_meta) if depth_meta is not None else load_media_meta(episode_dir, "depth")
+        self.export_depth = export_depth
+        self.depth_meta = (
+            dict(depth_meta)
+            if depth_meta is not None
+            else (load_media_meta(episode_dir, "depth") if export_depth else {})
+        )
         self.depth_decode_stats: dict[str, Any] = {}
         self.allow_extra_tail_frame = bool(self.meta.get("_trimmed_extra_tail_frame", False))
         self.frame_tasks = list(frame_tasks) if frame_tasks is not None else [task] * len(frames)
         self.task_indices = dict(task_indices or {task: task_idx})
         self.task_mapping = dict(task_mapping or {"status": "legacy_single_task"})
+        self.copy_rgb_mp4 = copy_rgb_mp4
+        self.progress_reporter = None
         if len(self.frame_tasks) != len(self.frames):
             raise ValueError(
                 f"frame task count mismatch: frames={len(self.frames)} tasks={len(self.frame_tasks)}"
@@ -774,6 +843,32 @@ class UnrealEpisode:
             )
             for camera in camera_keys
         }
+
+    def set_progress_reporter(self, reporter):
+        self.progress_reporter = reporter
+
+    def report_progress(self, stage: str, frames: int, total_frames: int, camera: str | None = None):
+        if self.progress_reporter is None:
+            return
+        self.progress_reporter(
+            {
+                "stage": stage,
+                "frames": frames,
+                "total_frames": total_frames,
+                "camera": camera,
+            }
+        )
+
+    @property
+    def direct_video_paths(self) -> dict[str, str]:
+        if not self.copy_rgb_mp4 or self.allow_extra_tail_frame:
+            return {}
+        paths: dict[str, str] = {}
+        for camera in self.camera_keys:
+            source = self.image_sources[camera]
+            if source.video_path is not None:
+                paths[f"video.{camera}"] = str(source.video_path)
+        return paths
 
     def __len__(self) -> int:
         return len(self.frames)
@@ -798,10 +893,11 @@ class UnrealEpisode:
             "created_at": self.meta.get("created_at", ""),
             "updated_at": self.meta.get("updated_at", ""),
             "rgb_media_meta": self.rgb_meta,
-            "depth_media_meta": self.depth_meta,
-            "depth_output_format": "uint16_mm_png",
             "depth_decode_stats": self.depth_decode_stats,
         }
+        if self.export_depth:
+            metadata["depth_media_meta"] = self.depth_meta
+            metadata["depth_output_format"] = "uint16_mm_png"
         for camera in self.camera_keys:
             video_key = f"video.{camera}"
             metadata[f"{video_key}.K"] = intrinsic_4(self.frames[0], camera)
@@ -811,6 +907,8 @@ class UnrealEpisode:
         return metadata
 
     def prepare_episode(self, output_root: Path) -> dict[str, Any]:
+        if not self.export_depth:
+            return {}
         storage = str(self.depth_meta.get("storage", "")).strip().lower()
         encoding = str(self.depth_meta.get("video_encoding", "")).strip().lower()
         unit = str(self.depth_meta.get("depth_unit", "")).strip().lower()
@@ -837,6 +935,8 @@ class UnrealEpisode:
         try:
             import cv2
 
+            total_depth_frames = len(self.frames) * len(self.camera_keys)
+            decoded_depth_frames = 0
             for camera in self.camera_keys:
                 video_path = self.episode_dir / "depth" / f"{camera}.mp4"
                 if not path_exists(video_path):
@@ -864,6 +964,13 @@ class UnrealEpisode:
                         rgb = bgr[..., ::-1]
                         depth_mm, valid = decode_hue_depth_rgb(rgb, min_meters, max_meters)
                         Image.fromarray(depth_mm).save(camera_dir / f"{frame_index:05d}.png")
+                        decoded_depth_frames += 1
+                        self.report_progress(
+                            "depth_decode",
+                            decoded_depth_frames,
+                            total_depth_frames,
+                            camera,
+                        )
                         frame_valid = int(valid.sum())
                         valid_pixels += frame_valid
                         total_pixels += int(valid.size)
@@ -915,6 +1022,8 @@ class UnrealEpisode:
         episode_index: int,
         prepared: dict[str, Any],
     ):
+        if not prepared:
+            return
         chunk = int(episode_index) // 1000
         for camera in self.camera_keys:
             source_dir = Path(prepared["camera_dirs"][camera])
@@ -938,6 +1047,8 @@ class UnrealEpisode:
             pass
 
     def discard_prepared_episode(self, prepared: dict[str, Any]):
+        if not prepared:
+            return
         staging_root = Path(prepared["staging_root"])
         shutil.rmtree(staging_root, ignore_errors=True)
         try:
@@ -948,7 +1059,12 @@ class UnrealEpisode:
             shutil.rmtree(Path(path), ignore_errors=True)
 
     def __iter__(self):
-        image_iters = {camera: self.image_sources[camera].iter_rgb() for camera in self.camera_keys}
+        direct_video_keys = set(self.direct_video_paths)
+        image_iters = {
+            camera: self.image_sources[camera].iter_rgb()
+            for camera in self.camera_keys
+            if f"video.{camera}" not in direct_video_keys
+        }
         first_body_inv: np.ndarray | None = None
 
         for frame_index, frame in enumerate(self.frames):
@@ -965,7 +1081,8 @@ class UnrealEpisode:
                 ACTION_KEY: local_pose.copy(),
             }
             for camera in self.camera_keys:
-                item[f"video.{camera}"] = next(image_iters[camera])
+                if camera in image_iters:
+                    item[f"video.{camera}"] = next(image_iters[camera])
             yield item, frame_task
 
 
@@ -989,6 +1106,9 @@ class UnrealEpisodeCollection:
         initial_repairs: list[dict[str, Any]] | None = None,
         initial_exclusions: list[dict[str, Any]] | None = None,
         initial_warnings: list[dict[str, Any]] | None = None,
+        export_depth: bool = True,
+        copy_rgb_mp4: bool = False,
+        log_interval_seconds: float = 30.0,
     ):
         self.raw_dir = Path(raw_dir)
         self.camera_keys = camera_keys
@@ -999,6 +1119,9 @@ class UnrealEpisodeCollection:
         self.target_schema = target_schema
         self.keep_all_schemas = keep_all_schemas
         self.trim_extra_tail_frame = trim_extra_tail_frame
+        self.export_depth = export_depth
+        self.copy_rgb_mp4 = copy_rgb_mp4
+        self.log_interval_seconds = max(1.0, float(log_interval_seconds))
         self.failed_episodes: list[dict[str, Any]] = list(initial_failures or [])
         self.repaired_episodes: list[dict[str, Any]] = list(initial_repairs or [])
         self.excluded_episodes: list[dict[str, Any]] = list(initial_exclusions or [])
@@ -1073,10 +1196,13 @@ class UnrealEpisodeCollection:
     def _load_episodes(self):
         loaded = []
         episode_dirs = scan_episode_dirs(self.raw_dir)
-        logging.info("Found %d episode_meta.json files under %s", len(episode_dirs), self.raw_dir)
+        total = len(episode_dirs)
+        scan_started = time.time()
+        last_progress = scan_started
+        logging.info("[scan] found %d episode_meta.json files under %s", total, self.raw_dir)
 
         for index, episode_dir in enumerate(episode_dirs, start=1):
-            logging.info("Scanning episode %d / %d: %s", index, len(episode_dirs), episode_dir)
+            logging.debug("[scan] scanning episode %d/%d: %s", index, total, episode_dir)
             meta_path = episode_dir / "episode_meta.json"
             frames_path = episode_dir / "frames.jsonl"
             try:
@@ -1092,16 +1218,16 @@ class UnrealEpisodeCollection:
                             "error": reason,
                         }
                     )
-                    logging.info("Skipping non-completed episode at %s: %s", episode_dir, reason)
+                    logging.debug("[scan] skipping non-completed episode at %s: %s", episode_dir, reason)
                     continue
 
                 rgb_meta = load_media_meta(episode_dir, "rgb")
-                depth_meta = load_media_meta(episode_dir, "depth")
+                depth_meta = load_media_meta(episode_dir, "depth") if self.export_depth else {}
                 meta, metadata_repairs = validate_media_meta(
                     episode_dir,
                     meta,
                     rgb_meta,
-                    depth_meta,
+                    depth_meta if self.export_depth else None,
                 )
                 if metadata_repairs:
                     self.repaired_episodes.append(
@@ -1113,7 +1239,8 @@ class UnrealEpisodeCollection:
                         }
                     )
                 self.warnings.extend(find_undeclared_media(episode_dir, rgb_meta, "rgb"))
-                self.warnings.extend(find_undeclared_media(episode_dir, depth_meta, "depth"))
+                if self.export_depth:
+                    self.warnings.extend(find_undeclared_media(episode_dir, depth_meta, "depth"))
 
                 missing = [camera for camera in self.camera_keys if camera not in (meta.get("camera_names") or [])]
                 if missing:
@@ -1126,7 +1253,7 @@ class UnrealEpisodeCollection:
                             raise ValueError(f"frame {frame.get('frame_index')} missing camera fields for {camera}")
 
                 task, task_info = load_task_info(episode_dir)
-                logging.info("Validating fixed camera extrinsics for %s", episode_dir)
+                logging.debug("[scan] validating fixed camera extrinsics for %s", episode_dir)
                 body_from_camera = validate_fixed_extrinsics(
                     episode_dir,
                     frames,
@@ -1146,10 +1273,33 @@ class UnrealEpisodeCollection:
                         depth_meta,
                     )
                 )
-                logging.info("Accepted episode %s with %d frames", episode_dir, len(frames))
+                logging.debug("[scan] accepted episode %s with %d frames", episode_dir, len(frames))
             except Exception as exc:
                 self._record_failure(episode_dir, "episode_scan", exc)
 
+            now = time.time()
+            if index == total or now - last_progress >= self.log_interval_seconds:
+                logging.info(
+                    "[scan] progress %d/%d valid=%d skipped=%d metadata_repaired=%d warnings=%d elapsed=%.1fs",
+                    index,
+                    total,
+                    len(loaded),
+                    len(self.failed_episodes),
+                    len(self.repaired_episodes),
+                    len(self.warnings),
+                    now - scan_started,
+                )
+                last_progress = now
+
+        logging.info(
+            "[scan] done total=%d valid=%d skipped=%d metadata_repaired=%d warnings=%d elapsed=%.1fs",
+            total,
+            len(loaded),
+            len(self.failed_episodes),
+            len(self.repaired_episodes),
+            len(self.warnings),
+            time.time() - scan_started,
+        )
         return loaded
 
     def _record_failure(self, episode_dir: Path, stage: str, error: Exception):
@@ -1160,7 +1310,7 @@ class UnrealEpisodeCollection:
         }
         self.failed_episodes.append(failure)
         if self.skip_invalid_episodes:
-            logging.warning("Skipping invalid episode at %s during %s: %s", episode_dir, stage, error)
+            logging.debug("Skipping invalid episode at %s during %s: %s", episode_dir, stage, error)
             return
         raise error
 
@@ -1178,7 +1328,7 @@ class UnrealEpisodeCollection:
             "actual_schema": schema_suffix(actual_schema),
         }
         self.excluded_episodes.append(exclusion)
-        logging.info(
+        logging.debug(
             "Excluding episode from schema %s because it belongs to %s: %s",
             exclusion["selected_schema"],
             exclusion["actual_schema"],
@@ -1204,7 +1354,7 @@ class UnrealEpisodeCollection:
                 }
                 self.repaired_episodes.append(repair)
                 meta["_trimmed_extra_tail_frame"] = True
-                logging.warning(
+                logging.debug(
                     "Trimming one extra tail frame in %s: meta.frame_count=%d frames.jsonl=%d",
                     episode_dir,
                     expected,
@@ -1224,11 +1374,14 @@ class UnrealEpisodeCollection:
             skip_invalid_episodes=True,
             target_schema=schema,
             trim_extra_tail_frame=self.trim_extra_tail_frame,
+            export_depth=self.export_depth,
+            copy_rgb_mp4=self.copy_rgb_mp4,
             initial_episodes=self.schema_valid_episodes,
             initial_failures=self.failed_episodes,
             initial_repairs=self.repaired_episodes,
             initial_exclusions=[],
             initial_warnings=self.warnings,
+            log_interval_seconds=self.log_interval_seconds,
         )
 
     def for_episodes(
@@ -1247,6 +1400,8 @@ class UnrealEpisodeCollection:
             skip_invalid_episodes=True,
             target_schema=target_schema,
             trim_extra_tail_frame=self.trim_extra_tail_frame,
+            export_depth=self.export_depth,
+            copy_rgb_mp4=self.copy_rgb_mp4,
             initial_episodes=episodes,
             initial_failures=[],
             initial_repairs=[
@@ -1260,6 +1415,7 @@ class UnrealEpisodeCollection:
                 for item in self.warnings
                 if item.get("source_episode_path") in source_paths
             ],
+            log_interval_seconds=self.log_interval_seconds,
         )
 
     def __len__(self) -> int:
@@ -1299,6 +1455,8 @@ class UnrealEpisodeCollection:
                     frame_tasks,
                     task_indices,
                     task_mapping,
+                    export_depth=self.export_depth,
+                    copy_rgb_mp4=self.copy_rgb_mp4,
                 )
             except Exception as exc:
                 self._record_failure(episode_dir, "episode_prepare", exc)
@@ -1390,6 +1548,150 @@ def write_conversion_report(root: Path, report: dict[str, Any]):
         report.get("num_successful"),
         report.get("num_failed"),
     )
+
+
+def load_completed_scene_report(root: Path, require_depth: bool = True) -> dict[str, Any] | None:
+    report_path = root / "meta" / "unreal_conversion_report.json"
+    required_paths = [
+        report_path,
+        root / "meta" / "info.json",
+        root / "meta" / "episodes.jsonl",
+        root / "meta" / "episodes_extras.jsonl",
+        root / "episodes_extras.parquet",
+        root / "data",
+        root / "videos",
+    ]
+    if require_depth:
+        required_paths.append(root / "images")
+    if any(not path.exists() for path in required_paths):
+        return None
+
+    try:
+        report = load_json(report_path)
+    except Exception as exc:
+        logging.warning("Could not read existing conversion report at %s: %s", report_path, exc)
+        return None
+
+    if report.get("status") != "completed":
+        return None
+    if int(report.get("num_successful", 0)) <= 0:
+        return None
+    sidecars = report.get("sidecars") or {}
+    depth_report = sidecars.get("depth_sidecars") or {}
+    if require_depth and depth_report.get("status") not in (None, "completed"):
+        return None
+    return report
+
+
+def has_scene_output(root: Path) -> bool:
+    if not root.exists():
+        return False
+    try:
+        next(root.iterdir())
+    except StopIteration:
+        return False
+    return True
+
+
+def default_scan_cache_path(output_dir: Path) -> Path:
+    return output_dir / "unreal_scan_cache.pkl"
+
+
+def selected_scan_cache_path(output_dir: Path, value: str | None) -> Path:
+    return Path(value) if value else default_scan_cache_path(output_dir)
+
+
+def _normalized_path(path: Path) -> str:
+    return str(path.expanduser().resolve())
+
+
+def save_scan_cache(path: Path, collection: UnrealEpisodeCollection, args) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": SCAN_CACHE_VERSION,
+        "created_at": utc_now_iso(),
+        "raw_dir": _normalized_path(collection.raw_dir),
+        "camera_keys": collection.camera_keys,
+        "translation_tolerance_m": collection.translation_tolerance_m,
+        "rotation_tolerance_deg": collection.rotation_tolerance_deg,
+        "trim_extra_tail_frame": collection.trim_extra_tail_frame,
+        "split_by_schema": bool(args.split_by_schema),
+        "export_depth": collection.export_depth,
+        "copy_rgb_mp4": collection.copy_rgb_mp4,
+        "episodes": collection.schema_valid_episodes,
+        "failed_episodes": collection.failed_episodes,
+        "repaired_episodes": collection.repaired_episodes,
+        "excluded_episodes": collection.excluded_episodes,
+        "warnings": collection.warnings,
+    }
+    with path.open("wb") as file:
+        pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
+    logging.info("Wrote Unreal scan cache: %s (episodes=%d)", path, len(collection.schema_valid_episodes))
+
+
+def load_scan_cache(path: Path, raw_dir: Path, camera_keys: list[str], args) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Scan cache does not exist: {path}")
+    with path.open("rb") as file:
+        payload = pickle.load(file)
+
+    if payload.get("version") != SCAN_CACHE_VERSION:
+        raise ValueError(f"Unsupported scan cache version: {payload.get('version')}")
+    expected_raw_dir = _normalized_path(raw_dir)
+    if payload.get("raw_dir") != expected_raw_dir:
+        raise ValueError(f"Scan cache raw_dir mismatch: cache={payload.get('raw_dir')} current={expected_raw_dir}")
+    if list(payload.get("camera_keys") or []) != camera_keys:
+        raise ValueError(f"Scan cache camera_keys mismatch: cache={payload.get('camera_keys')} current={camera_keys}")
+    if bool(payload.get("trim_extra_tail_frame")) != bool(args.trim_extra_tail_frame):
+        raise ValueError("Scan cache trim_extra_tail_frame mismatch.")
+    if bool(payload.get("split_by_schema")) != bool(args.split_by_schema):
+        raise ValueError("Scan cache split_by_schema mismatch.")
+    if not getattr(args, "skip_depth", False) and payload.get("export_depth") is False:
+        raise ValueError("Scan cache was created with --skip_depth and cannot be reused for depth export.")
+    if float(payload.get("translation_tolerance_m")) != float(args.extrinsic_tolerance_translation_m):
+        raise ValueError("Scan cache extrinsic_tolerance_translation_m mismatch.")
+    if float(payload.get("rotation_tolerance_deg")) != float(args.extrinsic_tolerance_rotation_deg):
+        raise ValueError("Scan cache extrinsic_tolerance_rotation_deg mismatch.")
+    logging.info("Loaded Unreal scan cache: %s (episodes=%d)", path, len(payload.get("episodes") or []))
+    return payload
+
+
+def collection_from_scan_cache(
+    payload: dict[str, Any],
+    raw_dir: Path,
+    camera_keys: list[str],
+    args,
+) -> UnrealEpisodeCollection:
+    return UnrealEpisodeCollection(
+        raw_dir=raw_dir,
+        camera_keys=camera_keys,
+        get_task_idx=lambda _task: 0,
+        translation_tolerance_m=args.extrinsic_tolerance_translation_m,
+        rotation_tolerance_deg=args.extrinsic_tolerance_rotation_deg,
+        skip_invalid_episodes=args.skip_invalid_episodes,
+        keep_all_schemas=args.split_by_schema,
+        trim_extra_tail_frame=args.trim_extra_tail_frame,
+        initial_episodes=list(payload.get("episodes") or []),
+        initial_failures=list(payload.get("failed_episodes") or []),
+        initial_repairs=list(payload.get("repaired_episodes") or []),
+        initial_exclusions=list(payload.get("excluded_episodes") or []),
+        initial_warnings=list(payload.get("warnings") or []),
+        export_depth=not getattr(args, "skip_depth", False),
+        copy_rgb_mp4=getattr(args, "copy_rgb_mp4", False),
+        log_interval_seconds=getattr(args, "log_interval_seconds", 30.0),
+    )
+
+
+def quarantine_incomplete_scene_output(root: Path) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = root.with_name(f"{root.name}.incomplete.{timestamp}")
+    target = base
+    suffix = 1
+    while target.exists():
+        suffix += 1
+        target = root.with_name(f"{base.name}.{suffix}")
+    root.rename(target)
+    return target
 
 
 def validate_lerobot_dataset(repo_id: str, root: str | Path):
@@ -1510,10 +1812,15 @@ def summarize_depth_sidecars(root: Path, camera_keys: list[str]) -> dict[str, An
     return report
 
 
-def write_scene_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
+def write_scene_sidecars(root: Path, camera_keys: list[str], export_depth: bool = True) -> dict[str, Any]:
+    depth_sidecars = (
+        summarize_depth_sidecars(root, camera_keys)
+        if export_depth
+        else {"status": "skipped", "reason": "depth_export_disabled"}
+    )
     return {
         "episodes_extras_parquet": write_episode_extras_parquet(root),
-        "depth_sidecars": summarize_depth_sidecars(root, camera_keys),
+        "depth_sidecars": depth_sidecars,
     }
 
 
@@ -1534,21 +1841,38 @@ def group_episodes_by_schema(episodes: list[tuple]) -> dict[tuple[int, tuple[int
     return groups
 
 
-def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name: str, args, started_at: str) -> dict[str, Any]:
+def repair_stage_counts(repaired_episodes: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in repaired_episodes:
+        stage = str(item.get("stage") or "unknown")
+        counts[stage] = counts.get(stage, 0) + 1
+    return counts
+
+
+def run_conversion(
+    collection: UnrealEpisodeCollection,
+    root: Path,
+    dataset_name: str,
+    args,
+    started_at: str,
+    progress_label: str | None = None,
+) -> dict[str, Any]:
     if len(collection) == 0:
         completed_at = utc_now_iso()
         report = collection.build_report(root, started_at, completed_at, "no_valid_episodes")
         write_conversion_report(root, report)
         raise ValueError(f"No compatible Unreal episodes found under {collection.raw_dir}")
 
+    label = progress_label or str(root)
     logging.info(
-        "Prepared %d compatible episodes for %s; skipped/failed during scan: %d",
+        "%s prepared episodes=%d output=%s scan_failed=%d",
+        label,
         len(collection),
         root,
         len(collection.failed_episodes),
     )
     resolved_pix_fmt = select_video_pixel_format(collection.image_size, codec=args.codec, pix_fmt=args.pix_fmt)
-    logging.info("Using fps=%s image_size=%s pix_fmt=%s", collection.fps, collection.image_size, resolved_pix_fmt)
+    logging.info("%s media fps=%s image_size=%s pix_fmt=%s", label, collection.fps, collection.image_size, resolved_pix_fmt)
 
     from utils.lerobot.lerobot_creater import LeRobotCreator
 
@@ -1562,19 +1886,66 @@ def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name
         codec=args.codec,
         pix_fmt=resolved_pix_fmt,
         has_extras=True,
+        progress_interval_seconds=args.log_interval_seconds,
     )
     collection.get_task_idx = creator.add_task
 
     start_time = time.time()
+    last_submit_progress = start_time
     status = "failed"
     sidecar_report: dict[str, Any] = {}
     try:
         for episode_index, episode in enumerate(collection, start=1):
-            logging.info("Submitting episode %s / %s: %s", episode_index, len(collection), episode.episode_dir)
+            logging.debug("%s submitting episode %s/%s: %s", label, episode_index, len(collection), episode.episode_dir)
             creator.submit_episode(episode)
+            now = time.time()
+            if episode_index == len(collection) or now - last_submit_progress >= args.log_interval_seconds:
+                logging.info(
+                    "%s submit progress %d/%d elapsed=%.1fs",
+                    label,
+                    episode_index,
+                    len(collection),
+                    now - start_time,
+                )
+                last_submit_progress = now
 
-        logging.info("Waiting for worker processes and video encoders to finish")
-        worker_results = creator.wait()
+        def log_wait_progress(snapshot: dict[str, Any]):
+            active = snapshot.get("active") or []
+            active_text = ""
+            if active:
+                parts = []
+                for item in active[:3]:
+                    source = Path(str(item.get("source_episode_path") or "")).name
+                    stage = str(item.get("stage") or "frames")
+                    camera = item.get("camera")
+                    frames = item.get("frames")
+                    total_frames = item.get("total_frames")
+                    label_part = f"{source}:{stage}"
+                    if camera:
+                        label_part += f":{camera}"
+                    if total_frames:
+                        parts.append(f"{label_part}:{frames}/{total_frames}")
+                    else:
+                        parts.append(f"{label_part}:{frames}")
+                if len(active) > 3:
+                    parts.append(f"+{len(active) - 3} active")
+                active_text = " active=" + ", ".join(parts)
+            logging.info(
+                "%s %s progress completed=%d/%d failed=%d elapsed=%.1fs%s",
+                label,
+                snapshot.get("stage"),
+                snapshot.get("completed", 0),
+                snapshot.get("total", len(collection)),
+                snapshot.get("failed", 0),
+                time.time() - start_time,
+                active_text,
+            )
+
+        logging.info("%s waiting for worker processes and video encoders", label)
+        worker_results = creator.wait(
+            progress_callback=log_wait_progress,
+            log_interval_seconds=args.log_interval_seconds,
+        )
         for result in worker_results:
             if result.get("status") == "failed":
                 collection.failed_episodes.append(
@@ -1584,53 +1955,79 @@ def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name
                         "error": result.get("error", "unknown worker failure"),
                     }
                 )
-        logging.info("Reading written episode metadata from %s", root / "meta" / "episodes_extras.jsonl")
+        logging.info("%s reading written episode metadata from %s", label, root / "meta" / "episodes_extras.jsonl")
         collection.sync_successful_episodes_from_output(root)
-        sidecar_report = write_scene_sidecars(root, collection.camera_keys)
+        logging.info("%s writing and validating scene sidecars", label)
+        sidecar_report = write_scene_sidecars(root, collection.camera_keys, export_depth=collection.export_depth)
         if sidecar_report["depth_sidecars"].get("status") == "failed":
             raise ValueError("Depth sidecar validation failed")
-        logging.info("Validating generated LeRobot dataset at %s", root)
+        logging.info("%s validating generated LeRobot dataset at %s", label, root)
         validate_lerobot_dataset(repo_id=dataset_name, root=root)
         status = "completed"
     finally:
         if status != "completed":
             collection.sync_successful_episodes_from_output(root)
             if not sidecar_report:
-                sidecar_report = write_scene_sidecars(root, collection.camera_keys)
+                sidecar_report = write_scene_sidecars(root, collection.camera_keys, export_depth=collection.export_depth)
         completed_at = utc_now_iso()
         report = collection.build_report(root, started_at, completed_at, status)
         report["sidecars"] = sidecar_report
         write_conversion_report(root, report)
 
-    logging.info("Done! %d episodes in %.2fs -> %s", len(collection.successful_episodes), time.time() - start_time, root)
+    logging.info(
+        "%s done successful=%d failed=%d elapsed=%.1fs output=%s",
+        label,
+        len(collection.successful_episodes),
+        len(collection.failed_episodes),
+        time.time() - start_time,
+        root,
+    )
     report = collection.build_report(root, started_at, utc_now_iso(), status)
     report["sidecars"] = sidecar_report
     return report
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
     args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    if args.overwrite_incomplete and not args.resume:
+        raise ValueError("--overwrite_incomplete requires --resume.")
+    if args.reuse_scan_cache and args.scan_cache is None and not args.resume:
+        raise ValueError("--reuse_scan_cache without --scan_cache requires --resume so the default output_dir cache path is well-defined.")
 
     raw_dir = Path(args.raw_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     camera_keys = parse_camera_keys(args.camera_keys)
+    scan_cache_path = selected_scan_cache_path(output_dir, args.scan_cache)
     started_at = utc_now_iso()
     if args.dataset_name:
         logging.warning("--dataset_name is deprecated for Unreal scene-grouped export and will be ignored.")
     logging.info("Starting Unreal conversion raw_dir=%s output_dir=%s cameras=%s", raw_dir, output_dir, camera_keys)
 
-    collection = UnrealEpisodeCollection(
-        raw_dir=raw_dir,
-        camera_keys=camera_keys,
-        get_task_idx=lambda _task: 0,
-        translation_tolerance_m=args.extrinsic_tolerance_translation_m,
-        rotation_tolerance_deg=args.extrinsic_tolerance_rotation_deg,
-        skip_invalid_episodes=args.skip_invalid_episodes,
-        keep_all_schemas=args.split_by_schema,
-        trim_extra_tail_frame=args.trim_extra_tail_frame,
-    )
+    if args.reuse_scan_cache:
+        payload = load_scan_cache(scan_cache_path, raw_dir, camera_keys, args)
+        collection = collection_from_scan_cache(payload, raw_dir, camera_keys, args)
+    else:
+        collection = UnrealEpisodeCollection(
+            raw_dir=raw_dir,
+            camera_keys=camera_keys,
+            get_task_idx=lambda _task: 0,
+            translation_tolerance_m=args.extrinsic_tolerance_translation_m,
+            rotation_tolerance_deg=args.extrinsic_tolerance_rotation_deg,
+            skip_invalid_episodes=args.skip_invalid_episodes,
+            keep_all_schemas=args.split_by_schema,
+            trim_extra_tail_frame=args.trim_extra_tail_frame,
+            export_depth=not args.skip_depth,
+            copy_rgb_mp4=args.copy_rgb_mp4,
+            log_interval_seconds=args.log_interval_seconds,
+        )
+        if args.resume or args.scan_cache:
+            save_scan_cache(scan_cache_path, collection, args)
 
     if not collection.schema_valid_episodes:
         completed_at = utc_now_iso()
@@ -1638,34 +2035,79 @@ def main():
         write_json(output_dir / "unreal_conversion_report.json", report)
         raise ValueError(f"No schema-compatible Unreal episodes found under {raw_dir}")
 
+    repairs_by_stage = repair_stage_counts(collection.repaired_episodes)
+    logging.info(
+        "[compat] valid=%d skipped=%d repaired_total=%d repairs_by_stage=%s warnings=%d",
+        len(collection.schema_valid_episodes),
+        len(collection.failed_episodes),
+        len(collection.repaired_episodes),
+        repairs_by_stage,
+        len(collection.warnings),
+    )
+
     schema_groups = group_episodes_by_schema(collection.schema_valid_episodes) if args.split_by_schema else {None: collection.schema_valid_episodes}
-    group_reports: list[dict[str, Any]] = []
-    group_errors: list[dict[str, str]] = []
+    planned_groups: list[tuple[tuple[int, tuple[int, int]] | None, str, list[tuple]]] = []
     for schema, schema_episodes in sorted(
         schema_groups.items(),
         key=lambda item: schema_suffix(item[0]) if item[0] is not None else "",
     ):
-        schema_key = schema_suffix(schema) if schema is not None else ""
         scene_groups = group_episodes_by_scene(schema_episodes)
         for scene_id, scene_episodes in sorted(scene_groups.items()):
-            scene_root = output_dir / schema_key / scene_id if schema_key else output_dir / scene_id
-            scene_dataset_name = f"{schema_key}_{scene_id}" if schema_key else scene_id
-            logging.info(
-                "Converting scene=%s schema=%s -> %s (%d episodes)",
-                scene_id,
-                schema_key or "default",
+            planned_groups.append((schema, scene_id, scene_episodes))
+    logging.info(
+        "[plan] schemas=%d scene_groups=%d episodes=%d",
+        len(schema_groups),
+        len(planned_groups),
+        len(collection.schema_valid_episodes),
+    )
+
+    group_reports: list[dict[str, Any]] = []
+    group_errors: list[dict[str, str]] = []
+    for group_index, (schema, scene_id, scene_episodes) in enumerate(planned_groups, start=1):
+        schema_key = schema_suffix(schema) if schema is not None else ""
+        scene_root = output_dir / schema_key / scene_id if schema_key else output_dir / scene_id
+        scene_dataset_name = f"{schema_key}_{scene_id}" if schema_key else scene_id
+        scene_label = f"[scene {group_index}/{len(planned_groups)} schema={schema_key or 'default'} scene={scene_id}]"
+        if args.resume:
+            completed_report = load_completed_scene_report(scene_root, require_depth=not args.skip_depth)
+            if completed_report is not None:
+                logging.info("%s skipped completed output=%s", scene_label, scene_root)
+                completed_report["scene_id"] = scene_id
+                completed_report["schema_key"] = schema_key
+                completed_report["resume_action"] = "skipped_completed"
+                group_reports.append(completed_report)
+                continue
+            if has_scene_output(scene_root):
+                if not args.overwrite_incomplete:
+                    raise RuntimeError(
+                        f"Incomplete scene output exists at {scene_root}; "
+                        "rerun with --resume --overwrite_incomplete to rebuild it."
+                    )
+                quarantine_root = quarantine_incomplete_scene_output(scene_root)
+                logging.warning(
+                    "%s moved incomplete output before resume rebuild: %s -> %s",
+                    scene_label,
+                    scene_root,
+                    quarantine_root,
+                )
+
+        logging.info("%s start episodes=%d output=%s", scene_label, len(scene_episodes), scene_root)
+        scene_collection = collection.for_episodes(scene_episodes, target_schema=schema)
+        try:
+            report = run_conversion(
+                scene_collection,
                 scene_root,
-                len(scene_episodes),
+                scene_dataset_name,
+                args,
+                started_at,
+                progress_label=scene_label,
             )
-            scene_collection = collection.for_episodes(scene_episodes, target_schema=schema)
-            try:
-                report = run_conversion(scene_collection, scene_root, scene_dataset_name, args, started_at)
-                report["scene_id"] = scene_id
-                report["schema_key"] = schema_key
-                group_reports.append(report)
-            except Exception as exc:
-                logging.exception("Scene conversion failed for scene=%s schema=%s", scene_id, schema_key or "default")
-                group_errors.append({"scene_id": scene_id, "schema_key": schema_key, "error": str(exc)})
+            report["scene_id"] = scene_id
+            report["schema_key"] = schema_key
+            group_reports.append(report)
+        except Exception as exc:
+            logging.exception("%s failed", scene_label)
+            group_errors.append({"scene_id": scene_id, "schema_key": schema_key, "error": str(exc)})
 
     completed_at = utc_now_iso()
     top_report = {

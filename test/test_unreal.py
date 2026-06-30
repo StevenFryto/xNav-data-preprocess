@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -30,11 +31,16 @@ from unreal import (
     decode_hue_depth_rgb,
     group_episodes_by_scene,
     group_episodes_by_schema,
+    has_scene_output,
     find_undeclared_media,
     intrinsic_matrix,
     intrinsic_4,
+    collection_from_scan_cache,
+    load_completed_scene_report,
+    load_scan_cache,
     load_media_meta,
     resolve_frame_tasks,
+    save_scan_cache,
     scan_episode_dirs,
     validate_media_meta,
     validate_lerobot_dataset,
@@ -121,6 +127,177 @@ def write_episode(
 
 
 class UnrealConversionTests(unittest.TestCase):
+    def test_load_completed_scene_report_accepts_complete_output(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_resume_") as tmp:
+            root = Path(tmp)
+            meta_dir = root / "meta"
+            meta_dir.mkdir(parents=True)
+            for directory in ["data", "videos", "images"]:
+                (root / directory).mkdir()
+            (meta_dir / "info.json").write_text("{}", encoding="utf-8")
+            (meta_dir / "episodes.jsonl").write_text("{}\n", encoding="utf-8")
+            (meta_dir / "episodes_extras.jsonl").write_text("{}\n", encoding="utf-8")
+            (root / "episodes_extras.parquet").touch()
+            report = {
+                "status": "completed",
+                "num_successful": 2,
+                "sidecars": {"depth_sidecars": {"status": "completed"}},
+            }
+            (meta_dir / "unreal_conversion_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+            loaded = load_completed_scene_report(root)
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["num_successful"], 2)
+
+    def test_load_completed_scene_report_rejects_incomplete_output(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_resume_") as tmp:
+            root = Path(tmp)
+            (root / "meta").mkdir(parents=True)
+            (root / "meta" / "unreal_conversion_report.json").write_text(
+                json.dumps({"status": "failed", "num_successful": 1}),
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(load_completed_scene_report(root))
+            self.assertTrue(has_scene_output(root))
+
+    def test_load_completed_scene_report_accepts_no_depth_output_when_not_required(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_resume_") as tmp:
+            root = Path(tmp)
+            meta_dir = root / "meta"
+            meta_dir.mkdir(parents=True)
+            for directory in ["data", "videos"]:
+                (root / directory).mkdir()
+            (meta_dir / "info.json").write_text("{}", encoding="utf-8")
+            (meta_dir / "episodes.jsonl").write_text("{}\n", encoding="utf-8")
+            (meta_dir / "episodes_extras.jsonl").write_text("{}\n", encoding="utf-8")
+            (root / "episodes_extras.parquet").touch()
+            report = {
+                "status": "completed",
+                "num_successful": 1,
+                "sidecars": {"depth_sidecars": {"status": "skipped", "reason": "depth_export_disabled"}},
+            }
+            (meta_dir / "unreal_conversion_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+            self.assertIsNotNone(load_completed_scene_report(root, require_depth=False))
+            self.assertIsNone(load_completed_scene_report(root, require_depth=True))
+
+    def test_has_scene_output_ignores_missing_and_empty_dirs(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_resume_") as tmp:
+            root = Path(tmp)
+            missing = root / "missing"
+            empty = root / "empty"
+            empty.mkdir()
+
+            self.assertFalse(has_scene_output(missing))
+            self.assertFalse(has_scene_output(empty))
+
+    def test_scan_cache_round_trips_collection_without_rescan(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_scan_cache_") as tmp:
+            root = Path(tmp)
+            write_episode(root, [make_frame(0, 0.0, 100.0)])
+            args = SimpleNamespace(
+                split_by_schema=True,
+                trim_extra_tail_frame=False,
+                extrinsic_tolerance_translation_m=1e-4,
+                extrinsic_tolerance_rotation_deg=0.1,
+                skip_invalid_episodes=True,
+            )
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                keep_all_schemas=True,
+            )
+            cache_path = root / "scan_cache.pkl"
+
+            save_scan_cache(cache_path, collection, args)
+            payload = load_scan_cache(cache_path, root, ["front"], args)
+            cached = collection_from_scan_cache(payload, root, ["front"], args)
+
+            self.assertEqual(len(cached.schema_valid_episodes), 1)
+            self.assertEqual(cached.schema_groups["fps10_3x4"]["num_episodes"], 1)
+
+    def test_collection_skip_depth_does_not_require_depth_metadata(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_skip_depth_") as tmp:
+            root = Path(tmp)
+            write_episode(root, [make_frame(0, 0.0, 100.0)])
+            shutil.rmtree(next(root.glob("scene_*/user_*/episode_*")) / "depth")
+
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                export_depth=False,
+            )
+
+            self.assertEqual(len(collection.schema_valid_episodes), 1)
+
+    def test_unreal_episode_copy_rgb_mp4_skips_frame_images(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_copy_rgb_") as tmp:
+            root = Path(tmp)
+            frames = [make_frame(0, 0.0, 100.0)]
+            episode_dir, meta = write_episode(root, frames)
+            body_from_camera = validate_fixed_extrinsics(episode_dir, frames, ["front"], 1e-4, 0.1)
+            source_video = episode_dir / "rgb" / "front.mp4"
+            source_video.touch()
+            episode = UnrealEpisode(
+                episode_dir,
+                meta,
+                frames,
+                ["front"],
+                "",
+                0,
+                [],
+                body_from_camera,
+                load_media_meta(episode_dir, "rgb"),
+                {},
+                copy_rgb_mp4=True,
+            )
+            episode.image_sources = {
+                "front": SimpleNamespace(video_path=source_video),
+            }
+
+            item, _task = next(iter(episode))
+
+            self.assertEqual(episode.direct_video_paths, {"video.front": str(source_video)})
+            self.assertNotIn("video.front", item)
+            self.assertIn(STATE_KEY, item)
+
+    def test_scan_cache_rejects_mismatched_camera_keys(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_scan_cache_") as tmp:
+            root = Path(tmp)
+            write_episode(root, [make_frame(0, 0.0, 100.0)])
+            args = SimpleNamespace(
+                split_by_schema=True,
+                trim_extra_tail_frame=False,
+                extrinsic_tolerance_translation_m=1e-4,
+                extrinsic_tolerance_rotation_deg=0.1,
+                skip_invalid_episodes=True,
+            )
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                keep_all_schemas=True,
+            )
+            cache_path = root / "scan_cache.pkl"
+
+            save_scan_cache(cache_path, collection, args)
+
+            with self.assertRaisesRegex(ValueError, "camera_keys mismatch"):
+                load_scan_cache(cache_path, root, ["rear"], args)
+
     def test_validate_lerobot_dataset_uses_local_metadata_only(self):
         with tempfile.TemporaryDirectory(prefix="unreal_lerobot_") as tmp:
             root = Path(tmp)

@@ -4,6 +4,7 @@ import tempfile
 import time
 import queue # For access to queue.Empty if needed, though mp.Queue handles it.
 import logging
+import threading
 import traceback
 from pathlib import Path
 from typing import Dict, Any, Callable, Iterator, Optional, Union, Tuple, List
@@ -74,7 +75,19 @@ class MetadataClient:
 
 class WorkerEpisodeBuilder:
     """Manages state for building a single episode within a Worker Process."""
-    def __init__(self, root: Path, meta_client: MetadataClient, features: Dict, fps: int, video_queue: mp.Queue, codec: str = "h264", pix_fmt: str = "yuv420p", has_extras: bool = False, extra_metadata: Dict = None):
+    def __init__(
+        self,
+        root: Path,
+        meta_client: MetadataClient,
+        features: Dict,
+        fps: int,
+        video_queue: mp.Queue,
+        codec: str = "h264",
+        pix_fmt: str = "yuv420p",
+        has_extras: bool = False,
+        extra_metadata: Dict = None,
+        direct_video_paths: Dict[str, str] = None,
+    ):
         self.root = root
         self.meta = meta_client
         self.features = features
@@ -84,6 +97,7 @@ class WorkerEpisodeBuilder:
         self.pix_fmt = pix_fmt
         self.has_extras = has_extras
         self.extra_metadata = extra_metadata or {}
+        self.direct_video_paths = direct_video_paths or {}
         
         # Delay episode index allocation until all input frames and optional
         # sidecars have been prepared successfully.
@@ -107,9 +121,11 @@ class WorkerEpisodeBuilder:
         self.staging_dir = Path(tempfile.mkdtemp(prefix="episode_", dir=staging_root))
         self.temp_image_dirs = {}
         for key in self.image_keys:
-             p = self.staging_dir / key
-             p.mkdir(parents=True, exist_ok=True)
-             self.temp_image_dirs[key] = p
+            if key in self.direct_video_paths:
+                continue
+            p = self.staging_dir / key
+            p.mkdir(parents=True, exist_ok=True)
+            self.temp_image_dirs[key] = p
              
         self.frame_count = 0
         self.tasks_set = set()
@@ -125,6 +141,8 @@ class WorkerEpisodeBuilder:
         
         # Save Images
         for key in self.image_keys:
+            if key in self.direct_video_paths:
+                continue
             if key in frame:
                 img = process_image(frame[key])
                 img_path = self.temp_image_dirs[key] / f"frame_{self.frame_count:06d}.png"
@@ -207,12 +225,21 @@ class WorkerEpisodeBuilder:
         
         # Submit Video Encoding Jobs
         for key in self.image_keys:
-            temp_dir = self.temp_image_dirs[key]
             out_dir = self.root / "videos" / f"chunk-{self.chunk:03d}" / key
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / f"episode_{self.episode_index:06d}.mp4"
-            
-            self.video_queue.put((str(temp_dir), str(out_path), self.fps, self.codec, self.pix_fmt))
+            if key in self.direct_video_paths:
+                self.video_queue.put(("copy", self.direct_video_paths[key], str(out_path)))
+            else:
+                temp_dir = self.temp_image_dirs[key]
+                self.video_queue.put((str(temp_dir), str(out_path), self.fps, self.codec, self.pix_fmt))
+
+        if not self.temp_image_dirs:
+            shutil.rmtree(self.staging_dir, ignore_errors=True)
+            try:
+                self.staging_dir.parent.rmdir()
+            except OSError:
+                pass
 
         # Update Meta
         self.meta.append_episode({
@@ -303,6 +330,10 @@ def video_encoder_service(video_queue: mp.JoinableQueue):
             break
         
         try:
+            if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == "copy":
+                _, source_path, out_path = msg
+                shutil.copy2(source_path, out_path)
+                continue
             temp_dir, out_path, fps, vcodec, pix_fmt = msg
             encode_video_frames(
                 video_path=out_path,
@@ -331,6 +362,7 @@ def worker_service(
     resp_queue: mp.Queue,
     video_queue: mp.JoinableQueue,
     result_queue: mp.Queue,
+    progress_queue: mp.Queue,
     root: Path,
     features: Dict,
     fps: int,
@@ -338,6 +370,7 @@ def worker_service(
     codec: str = "h264",
     pix_fmt: str = "yuv420p",
     has_extras: bool = False,
+    progress_interval_seconds: float = 30.0,
 ):
     """Entry point for Worker Processes."""
     meta_client = MetadataClient(meta_req_queue, resp_queue, rank)
@@ -357,20 +390,77 @@ def worker_service(
         completed = False
         source = str(getattr(item, "episode_dir", ""))
         try:
+            total_frames = None
+            if not callable(item):
+                try:
+                    total_frames = len(item)
+                except TypeError:
+                    total_frames = None
+
             if hasattr(item, "prepare_episode"):
+                if hasattr(item, "set_progress_reporter"):
+                    last_prepare_progress = {"time": 0.0}
+                    def report_prepare_progress(payload, *, item_source=source):
+                        now = time.time()
+                        frames = payload.get("frames")
+                        total_frames = payload.get("total_frames")
+                        if (
+                            frames != total_frames
+                            and now - last_prepare_progress["time"] < max(1.0, float(progress_interval_seconds))
+                        ):
+                            return
+                        last_prepare_progress["time"] = now
+                        progress_queue.put(
+                            {
+                                "status": "progress",
+                                "source_episode_path": item_source,
+                                "rank": rank,
+                                **payload,
+                            }
+                        )
+
+                    item.set_progress_reporter(report_prepare_progress)
                 prepared = item.prepare_episode(root)
+                progress_queue.put(
+                    {
+                        "status": "progress",
+                        "source_episode_path": source,
+                        "rank": rank,
+                        "stage": "prepare_done",
+                        "frames": total_frames,
+                        "total_frames": total_frames,
+                    }
+                )
 
             # Handle incoming task (create iterator)
             extra_metadata = {}
+            direct_video_paths = {}
             if callable(item):
                 iterator = item()
             else:
                 iterator = item
                 if has_extras and hasattr(item, "metadata"):
                     extra_metadata = item.metadata
+                if hasattr(item, "direct_video_paths"):
+                    direct_video_paths = item.direct_video_paths
+                    if callable(direct_video_paths):
+                        direct_video_paths = direct_video_paths()
 
-            builder = WorkerEpisodeBuilder(root, meta_client, features, fps, video_queue, codec=codec, pix_fmt=pix_fmt, has_extras=has_extras, extra_metadata=extra_metadata)
+            builder = WorkerEpisodeBuilder(
+                root,
+                meta_client,
+                features,
+                fps,
+                video_queue,
+                codec=codec,
+                pix_fmt=pix_fmt,
+                has_extras=has_extras,
+                extra_metadata=extra_metadata,
+                direct_video_paths=direct_video_paths,
+            )
             
+            last_progress = time.time()
+            interval = max(1.0, float(progress_interval_seconds))
             for element in iterator:
                 # Unpack tuple (frame, task) or dict
                 if isinstance(element, tuple) and len(element) == 2:
@@ -386,7 +476,30 @@ def worker_service(
                     continue
                     
                 builder.add_frame(frame, task)
+                now = time.time()
+                if now - last_progress >= interval:
+                    progress_queue.put(
+                        {
+                            "status": "progress",
+                            "source_episode_path": source,
+                            "stage": "frame_iter",
+                            "frames": builder.frame_count,
+                            "total_frames": total_frames,
+                            "rank": rank,
+                        }
+                    )
+                    last_progress = now
             
+            progress_queue.put(
+                {
+                    "status": "progress",
+                    "source_episode_path": source,
+                    "rank": rank,
+                    "stage": "finalize",
+                    "frames": builder.frame_count,
+                    "total_frames": total_frames,
+                }
+            )
             commit_prepared = None
             if prepared is not None and hasattr(item, "commit_prepared_episode"):
                 commit_prepared = lambda episode_index: item.commit_prepared_episode(
@@ -438,7 +551,8 @@ class LeRobotCreator:
         num_video_encoders: int = 2,
         codec: str = "h264",
         pix_fmt: str = "yuv420p",
-        has_extras: bool = False
+        has_extras: bool = False,
+        progress_interval_seconds: float = 30.0,
     ):
         self.root = Path(root)
         self.fps = fps
@@ -447,6 +561,7 @@ class LeRobotCreator:
         self.codec = codec
         self.pix_fmt = pix_fmt
         self.has_extras = has_extras
+        self.progress_interval_seconds = max(1.0, float(progress_interval_seconds))
         
         # 1. Initialize Global Info (Safe single-process op before forking)
         # this will create meta dir if not exists and init info.json
@@ -458,7 +573,10 @@ class LeRobotCreator:
         self.meta_req_queue = mp.Queue()
         self.video_queue = mp.JoinableQueue()
         self.result_queue = mp.Queue()
+        self.progress_queue = mp.Queue()
         self.results = []
+        self.worker_progress: Dict[str, Dict[str, Any]] = {}
+        self.submitted_count = 0
         
         # Create dedicated reply queues for each worker
         # and the num_workers + 1 for creator if needed
@@ -497,6 +615,7 @@ class LeRobotCreator:
                     self.reply_queues[i],
                     self.video_queue,
                     self.result_queue,
+                    self.progress_queue,
                     self.root,
                     features,
                     fps,
@@ -504,6 +623,7 @@ class LeRobotCreator:
                     codec,
                     pix_fmt,
                     has_extras,
+                    self.progress_interval_seconds,
                 ),
                 daemon=True
             )
@@ -522,13 +642,81 @@ class LeRobotCreator:
         Blocks if all workers are busy (queue full).
         """
         self.task_queue.put(episode_iterator)
+        self.submitted_count += 1
 
-    def wait(self):
+    def _drain_results(self):
+        while True:
+            try:
+                result = self.result_queue.get_nowait()
+                self.results.append(result)
+                source = result.get("source_episode_path")
+                if source:
+                    self.worker_progress.pop(source, None)
+            except queue.Empty:
+                break
+
+    def _drain_progress(self):
+        while True:
+            try:
+                item = self.progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            source = item.get("source_episode_path")
+            if source:
+                self.worker_progress[source] = item
+
+    def _progress_snapshot(self, stage: str) -> Dict[str, Any]:
+        completed = sum(1 for result in self.results if result.get("status") == "completed")
+        failed = sum(1 for result in self.results if result.get("status") == "failed")
+        return {
+            "stage": stage,
+            "total": self.submitted_count,
+            "completed": completed,
+            "failed": failed,
+            "active": list(self.worker_progress.values()),
+        }
+
+    def _join_with_progress(
+        self,
+        join_func: Callable[[], None],
+        stage: str,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        log_interval_seconds: float,
+    ):
+        join_thread = threading.Thread(target=join_func, daemon=True)
+        join_thread.start()
+        last_progress = 0.0
+        interval = max(1.0, float(log_interval_seconds))
+        while join_thread.is_alive():
+            join_thread.join(timeout=1.0)
+            self._drain_progress()
+            self._drain_results()
+            if progress_callback is None:
+                continue
+            now = time.time()
+            if now - last_progress >= interval:
+                progress_callback(self._progress_snapshot(stage))
+                last_progress = now
+        self._drain_progress()
+        self._drain_results()
+        if progress_callback is not None:
+            progress_callback(self._progress_snapshot(stage))
+
+    def wait(
+        self,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        log_interval_seconds: float = 30.0,
+    ):
         """
         Waits for all submitted episodes to be processed and encoded, then shuts down.
         """
         # 1. Wait for all submitted tasks to be picked up and processed by workers
-        self.task_queue.join()
+        self._join_with_progress(
+            self.task_queue.join,
+            "workers",
+            progress_callback,
+            log_interval_seconds,
+        )
         
         # 2. Stop Workers
         for _ in range(self.num_workers):
@@ -539,7 +727,12 @@ class LeRobotCreator:
             p.join()
             
         # 3. Wait for all video encoding jobs to finish
-        self.video_queue.join()
+        self._join_with_progress(
+            self.video_queue.join,
+            "video_encoders",
+            progress_callback,
+            log_interval_seconds,
+        )
         
         # 4. Stop Encoders
         for _ in range(self.num_video_encoders):
@@ -552,9 +745,5 @@ class LeRobotCreator:
         self.meta_req_queue.put((CMD_STOP, None, None))
         self.meta_process.join()
 
-        while True:
-            try:
-                self.results.append(self.result_queue.get_nowait())
-            except queue.Empty:
-                break
+        self._drain_results()
         return list(self.results)

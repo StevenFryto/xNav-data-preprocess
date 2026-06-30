@@ -5,6 +5,7 @@ import importlib
 import logging
 import shutil
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -172,28 +173,34 @@ def encode_video_frames(
         value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
         video_options[key] = value
 
+    previous_av_level = av.logging.get_level()
+    capture = av.logging.Capture(local=False) if log_level is not None else nullcontext()
     if log_level is not None:
-        logging.getLogger("libav").setLevel(log_level)
+        av.logging.set_level(log_level)
+        av.logging.set_libav_level(log_level)
 
-    with av.open(str(video_path), "w") as output:
-        output_stream = output.add_stream(vcodec, fps, options=video_options)
-        output_stream.pix_fmt = pix_fmt
-        output_stream.width = width
-        output_stream.height = height
+    try:
+        with capture:
+            with av.open(str(video_path), "w") as output:
+                output_stream = output.add_stream(vcodec, fps, options=video_options)
+                output_stream.pix_fmt = pix_fmt
+                output_stream.width = width
+                output_stream.height = height
 
-        for input_data in input_list:
-            with Image.open(input_data) as input_image:
-                input_frame = av.VideoFrame.from_image(input_image.convert("RGB"))
-            packet = output_stream.encode(input_frame)
-            if packet:
-                output.mux(packet)
+                for input_data in input_list:
+                    with Image.open(input_data) as input_image:
+                        input_frame = av.VideoFrame.from_image(input_image.convert("RGB"))
+                    packet = output_stream.encode(input_frame)
+                    if packet:
+                        output.mux(packet)
 
-        packet = output_stream.encode()
-        if packet:
-            output.mux(packet)
-
-    if log_level is not None:
-        av.logging.restore_default_callback()
+                packet = output_stream.encode()
+                if packet:
+                    output.mux(packet)
+    finally:
+        if log_level is not None:
+            av.logging.set_level(previous_av_level)
+            av.logging.set_libav_level(previous_av_level)
 
     if not video_path.exists():
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
