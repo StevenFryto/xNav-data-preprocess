@@ -26,7 +26,9 @@ from unreal import (
     TASK_DESCRIPTION_KEY,
     UnrealEpisode,
     UnrealEpisodeCollection,
+    CLEANING_STUCK_KEEP_FRAMES_PER_SEGMENT,
     body_from_camera_for_frame,
+    build_cleaning_decision,
     build_features,
     decode_hue_depth_rgb,
     group_episodes_by_scene,
@@ -60,6 +62,15 @@ def make_frame(frame_index, body_x_cm, camera_x_cm):
         "camera_pose_front": [camera_x_cm, 0.0, 0.0, 0.0, 0.0, 0.0],
         "K_front": [100.0, 0.0, 2.0, 0.0, 110.0, 3.0, 0.0, 0.0, 1.0],
     }
+
+
+def make_timed_frame(frame_index, body_x_cm, body_y_cm=0.0, yaw_deg=0.0, fps=10):
+    frame = make_frame(frame_index, body_x_cm, camera_x_cm=body_x_cm + 100.0)
+    frame["timestamp_wall_sec"] = frame_index / fps
+    frame["timestamp_sim_sec"] = frame_index / fps
+    frame["pose"] = [body_x_cm, body_y_cm, 0.0, 0.0, 0.0, yaw_deg]
+    frame["camera_pose_front"] = [body_x_cm + 100.0, body_y_cm, 0.0, 0.0, 0.0, yaw_deg]
+    return frame
 
 
 def write_episode(
@@ -239,6 +250,106 @@ class UnrealConversionTests(unittest.TestCase):
             )
 
             self.assertEqual(len(collection.schema_valid_episodes), 1)
+
+    def test_clean_invalid_data_drops_direction_invalid_episode(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_clean_direction_") as tmp:
+            root = Path(tmp)
+            frames = [
+                make_timed_frame(index, body_x_cm=0.0, body_y_cm=index * 10.0, yaw_deg=0.0)
+                for index in range(30)
+            ]
+            write_episode(root, frames, fps=10)
+
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                export_depth=False,
+                clean_invalid_data=True,
+            )
+
+            self.assertEqual(len(collection), 0)
+            self.assertEqual(len(collection.excluded_episodes), 1)
+            self.assertEqual(collection.excluded_episodes[0]["reason"], "drop_direction_invalid")
+
+    def test_clean_invalid_data_compresses_stuck_episode_as_one_episode(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_clean_stuck_") as tmp:
+            root = Path(tmp)
+            # 先有明显位移（避免被判为全程静止），再接一段长于窗口的静止尾段触发压缩。
+            moving = [make_timed_frame(index, body_x_cm=index * 30.0) for index in range(30)]
+            stuck = [make_timed_frame(30 + offset, body_x_cm=29 * 30.0) for offset in range(70)]
+            frames = moving + stuck
+            episode_dir, _ = write_episode(root, frames, fps=10)
+
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                export_depth=False,
+                clean_invalid_data=True,
+                copy_rgb_mp4=True,
+            )
+
+            self.assertEqual(len(collection), 1)
+            cleaned_frames = collection.episodes[0][2]
+            cleaning = collection.episodes[0][1]["_cleaning"]
+            self.assertEqual(cleaning["decision"], "keep_compressed")
+            self.assertLess(len(cleaned_frames), len(frames))
+            self.assertEqual(len(cleaning["source_frame_indices"]), len(cleaned_frames))
+            self.assertEqual(collection.repaired_episodes[-1]["action"], "compressed_stuck_frames")
+
+            unreal_episode = next(iter(collection))
+            self.assertEqual(unreal_episode.episode_dir, episode_dir)
+            self.assertFalse(unreal_episode.direct_video_paths)
+            yielded = list(unreal_episode)
+            self.assertEqual(len(yielded), len(cleaned_frames))
+            first_kept_source = cleaning["source_frame_indices"][0]
+            self.assertEqual(int(yielded[0][0]["video.front"][0, 0, 0]), first_kept_source + 1)
+            self.assertEqual(unreal_episode.metadata["cleaning"]["decision"], "keep_compressed")
+
+    def test_cleaning_preserves_stuck_segment_with_yaw_change(self):
+        frames = [
+            make_timed_frame(index, body_x_cm=0.0, yaw_deg=max(0, index - 49))
+            for index in range(70)
+        ]
+
+        decision = build_cleaning_decision(frames, fps=10)
+
+        self.assertEqual(decision["decision"], "keep_compressed")
+        self.assertEqual(decision["dropped_stuck_frame_count"], 0)
+        self.assertTrue(decision["compressed_stuck_segments"][0]["preserved_all_due_to_yaw"])
+
+    def test_cleaning_drops_fully_static_episode(self):
+        # 整集位姿不变（无位移、无转向）-> 应整集丢弃，而非压缩保留。
+        frames = [make_timed_frame(index, body_x_cm=0.0, body_y_cm=0.0, yaw_deg=0.0) for index in range(70)]
+
+        decision = build_cleaning_decision(frames, fps=10)
+
+        self.assertEqual(decision["decision"], "drop_static_episode")
+        self.assertEqual(decision["drop_reasons"], ["static_episode"])
+        self.assertEqual(decision["cleaned_frame_count"], 0)
+        self.assertIn("static_episode", {rule["rule"] for rule in decision["validity_rules"]})
+
+    def test_cleaning_long_stuck_segment_compresses_to_fixed_count(self):
+        # 先有明显位移（避免被判全程静止），再接一段超长静止段。
+        moving = [make_timed_frame(index, body_x_cm=index * 10.0) for index in range(80)]
+        stuck = [make_timed_frame(80 + offset, body_x_cm=790.0) for offset in range(200)]
+        frames = moving + stuck
+
+        decision = build_cleaning_decision(frames, fps=10)
+
+        self.assertEqual(decision["decision"], "keep_compressed")
+        self.assertTrue(decision["compressed_stuck_segments"])
+        for segment in decision["compressed_stuck_segments"]:
+            if not segment["preserved_all_due_to_yaw"]:
+                # 与段时长无关：无论静止多久，只保留固定数量的代表帧。
+                self.assertEqual(segment["kept_frames"], CLEANING_STUCK_KEEP_FRAMES_PER_SEGMENT)
 
     def test_unreal_episode_copy_rgb_mp4_skips_frame_images(self):
         with tempfile.TemporaryDirectory(prefix="unreal_copy_rgb_") as tmp:

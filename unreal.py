@@ -99,6 +99,8 @@ import argparse
 import csv
 import json
 import logging
+import math
+import os
 import pickle
 import shutil
 import tempfile
@@ -113,6 +115,13 @@ import pandas as pd
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
+# 限制 OpenCV 解码线程：OpenCV 默认按机器全核开线程池/ffmpeg 解码线程，多 worker 或
+# 多实例并行时会造成线程超额订阅、调度颠簸。这里统一限制为小值（可用 XNAV_DECODE_THREADS
+# 覆盖）。单 worker 本就只解码一个 episode，并行度由 worker 数提供，无需每个解码占满核。
+RGB_DECODE_THREADS = max(1, int(os.environ.get("XNAV_DECODE_THREADS", "2")))
+# ffmpeg 解码线程数必须在 VideoCapture 创建前通过该环境变量设置（fork 后被子进程继承）。
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", f"threads;{RGB_DECODE_THREADS}")
+
 TASK_DESCRIPTION_KEY = "annotation.human.action.task_description"
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
@@ -121,6 +130,37 @@ DEFAULT_CAMERA_KEYS = ("front", "rear", "left", "right")
 DEPTH_DARK_THRESHOLD = 16
 DEPTH_SATURATION_THRESHOLD = 16
 SCAN_CACHE_VERSION = 1
+
+CLEANING_MIN_SPEED_CM_SEC = 20.0
+CLEANING_DEVIATION_ANGLE_DEG = 30.0
+CLEANING_TIME_CONSTANT = 0.7
+CLEANING_RECOVERY_TIME_CONSTANT = 0.15
+CLEANING_ENTER_SOFT = 0.55
+CLEANING_ENTER_HARD = 0.85
+CLEANING_EXIT_HARD = 0.40
+CLEANING_EXIT_SOFT = 0.20
+CLEANING_TELEPORT_RESET_CM = 500.0
+CLEANING_MAX_VIOLATION_RATIO = 0.05
+CLEANING_HARD_MIN_DURATION_SEC = 1.0
+CLEANING_MAX_HARD_RATIO = 0.02
+CLEANING_MAX_STUCK_RATIO = 0.10
+CLEANING_STUCK_WINDOW_SEC = 5.0
+CLEANING_STUCK_MAX_DISPLACEMENT_CM = 50.0
+# 每个静止段保留的代表帧数量（与时长无关）。固定计数而非按帧率降采样，
+# 避免极长静止段降采样后仍残留大量静止帧。
+CLEANING_STUCK_KEEP_FRAMES_PER_SEGMENT = 2
+CLEANING_STUCK_BOUNDARY_KEEP_FRAMES = 1
+CLEANING_STUCK_YAW_PRESERVE_THRESHOLD_DEG = 10.0
+CLEANING_MIN_CLEANED_FRAMES = 2
+# 整集级退化静止判据：整段轨迹 XY 活动范围小于该阈值且几乎没有偏航变化时，
+# 视为全程/近乎静止的退化 episode，直接整集丢弃而非压缩保留。
+CLEANING_MIN_EPISODE_DISPLACEMENT_CM = 50.0
+
+
+def limit_cv2_threads(cv2_module: Any) -> None:
+    set_num_threads = getattr(cv2_module, "setNumThreads", None)
+    if set_num_threads is not None:
+        set_num_threads(RGB_DECODE_THREADS)
 
 # UE 录制使用 +X 前、+Y 右、+Z 上；目标机体系要求 +Y 为左，因此只需要翻转 Y 轴。
 UE_TO_TARGET = np.diag([1.0, -1.0, 1.0]).astype(np.float32)
@@ -177,6 +217,11 @@ def parse_args():
         "--copy_rgb_mp4",
         action="store_true",
         help="Directly copy compatible source RGB MP4 files instead of decoding and re-encoding them.",
+    )
+    parser.add_argument(
+        "--clean_invalid_data",
+        action="store_true",
+        help="Drop direction-invalid episodes and compress stuck-only episodes during conversion.",
     )
     parser.add_argument(
         "--resume",
@@ -306,6 +351,512 @@ def episode_schema(meta: dict[str, Any]) -> tuple[int, tuple[int, int]]:
 def schema_suffix(schema: tuple[int, tuple[int, int]]) -> str:
     fps, (height, width) = schema
     return f"fps{fps}_{height}x{width}"
+
+
+LEVEL_OK = "ok"
+LEVEL_SOFT = "soft"
+LEVEL_HARD = "hard"
+
+
+@dataclass
+class CleaningFrameDiag:
+    frame_index: int
+    level: str
+    score: float
+    angle_deg: float
+    speed_cm_sec: float
+
+
+@dataclass
+class CleaningSegment:
+    level: str
+    start_index: int
+    end_index: int
+    start_frame: int
+    end_frame: int
+    peak_score: float = 0.0
+    peak_angle_deg: float = 0.0
+
+
+@dataclass
+class CleaningStuckSegment:
+    start_index: int
+    end_index: int
+    start_frame: int
+    end_frame: int
+    duration_sec: float = 0.0
+    min_displacement_cm: float = 0.0
+
+
+def cleaning_policy() -> dict[str, Any]:
+    return {
+        "min_speed_cm_sec": CLEANING_MIN_SPEED_CM_SEC,
+        "deviation_angle_deg": CLEANING_DEVIATION_ANGLE_DEG,
+        "time_constant": CLEANING_TIME_CONSTANT,
+        "recovery_time_constant": CLEANING_RECOVERY_TIME_CONSTANT,
+        "enter_soft": CLEANING_ENTER_SOFT,
+        "enter_hard": CLEANING_ENTER_HARD,
+        "exit_hard": CLEANING_EXIT_HARD,
+        "exit_soft": CLEANING_EXIT_SOFT,
+        "teleport_reset_cm": CLEANING_TELEPORT_RESET_CM,
+        "max_violation_ratio": CLEANING_MAX_VIOLATION_RATIO,
+        "hard_min_duration_sec": CLEANING_HARD_MIN_DURATION_SEC,
+        "max_hard_ratio": CLEANING_MAX_HARD_RATIO,
+        "max_stuck_ratio": CLEANING_MAX_STUCK_RATIO,
+        "stuck_window_sec": CLEANING_STUCK_WINDOW_SEC,
+        "stuck_max_displacement_cm": CLEANING_STUCK_MAX_DISPLACEMENT_CM,
+        "stuck_keep_frames_per_segment": CLEANING_STUCK_KEEP_FRAMES_PER_SEGMENT,
+        "stuck_boundary_keep_frames": CLEANING_STUCK_BOUNDARY_KEEP_FRAMES,
+        "stuck_yaw_preserve_threshold_deg": CLEANING_STUCK_YAW_PRESERVE_THRESHOLD_DEG,
+        "min_cleaned_frames": CLEANING_MIN_CLEANED_FRAMES,
+        "min_episode_displacement_cm": CLEANING_MIN_EPISODE_DISPLACEMENT_CM,
+    }
+
+
+def frame_pose_xy_yaw(frame: dict[str, Any]) -> tuple[float, float, float] | None:
+    pose = frame.get("pose")
+    if not isinstance(pose, (list, tuple)) or len(pose) < 6:
+        return None
+    try:
+        return float(pose[0]), float(pose[1]), float(pose[5])
+    except (TypeError, ValueError):
+        return None
+
+
+def frame_sim_time(frame: dict[str, Any], fallback_index: int) -> float:
+    for key in ("timestamp_sim_sec", "timestamp_wall_sec", "timestamp"):
+        value = frame.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return float(fallback_index) / 10.0
+
+
+def shortest_angle_deg(angle: float) -> float:
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def yaw_delta_deg(a: float, b: float) -> float:
+    return abs(shortest_angle_deg(b - a))
+
+
+def forward2d_from_yaw(yaw_deg: float) -> tuple[float, float]:
+    yaw = math.radians(yaw_deg)
+    return math.cos(yaw), math.sin(yaw)
+
+
+def next_cleaning_level(level: str, score: float) -> str:
+    if level == LEVEL_OK:
+        if score >= CLEANING_ENTER_HARD:
+            return LEVEL_HARD
+        if score >= CLEANING_ENTER_SOFT:
+            return LEVEL_SOFT
+        return LEVEL_OK
+    if level == LEVEL_SOFT:
+        if score >= CLEANING_ENTER_HARD:
+            return LEVEL_HARD
+        if score <= CLEANING_EXIT_SOFT:
+            return LEVEL_OK
+        return LEVEL_SOFT
+    if score <= CLEANING_EXIT_HARD:
+        return LEVEL_OK
+    return LEVEL_HARD
+
+
+def diagnose_direction(frames: list[dict[str, Any]]) -> tuple[list[CleaningFrameDiag | None], list[CleaningSegment]]:
+    per_frame: list[CleaningFrameDiag | None] = []
+    segments: list[CleaningSegment] = []
+    last_x: float | None = None
+    last_y: float | None = None
+    last_time: float | None = None
+    score = 0.0
+    level = LEVEL_OK
+    current_segment: CleaningSegment | None = None
+
+    for index, frame in enumerate(frames):
+        fidx = int(frame.get("frame_index", index))
+        pose = frame_pose_xy_yaw(frame)
+        if pose is None:
+            per_frame.append(None)
+            last_x = last_y = last_time = None
+            if current_segment is not None:
+                segments.append(current_segment)
+                current_segment = None
+            level = LEVEL_OK
+            score = 0.0
+            continue
+
+        x, y, yaw = pose
+        t = frame_sim_time(frame, index)
+        angle_deg = 0.0
+        speed = 0.0
+        bad = False
+
+        if last_x is not None and last_y is not None and last_time is not None:
+            dx = x - last_x
+            dy = y - last_y
+            disp = math.hypot(dx, dy)
+            dt = max(t - last_time, 1e-6)
+            if disp > CLEANING_TELEPORT_RESET_CM:
+                score = 0.0
+                if current_segment is not None:
+                    segments.append(current_segment)
+                    current_segment = None
+                level = LEVEL_OK
+            else:
+                speed = disp / dt
+                if speed >= CLEANING_MIN_SPEED_CM_SEC:
+                    fx, fy = forward2d_from_yaw(yaw)
+                    vlen = math.hypot(dx, dy)
+                    dot = (dx * fx + dy * fy) / max(vlen, 1e-9)
+                    dot = max(-1.0, min(1.0, dot))
+                    angle_deg = math.degrees(math.acos(dot))
+                    bad = angle_deg > CLEANING_DEVIATION_ANGLE_DEG
+
+                    tau = CLEANING_TIME_CONSTANT if bad else CLEANING_RECOVERY_TIME_CONSTANT
+                    alpha = 1.0 - math.exp(-dt / max(tau, 1e-9))
+                    target = 1.0 if bad else 0.0
+                    score += alpha * (target - score)
+
+        new_level = next_cleaning_level(level, score)
+        if new_level != level:
+            if current_segment is not None:
+                segments.append(current_segment)
+                current_segment = None
+            if new_level != LEVEL_OK:
+                current_segment = CleaningSegment(new_level, index, index, fidx, fidx, score, angle_deg)
+        elif current_segment is not None:
+            current_segment.end_index = index
+            current_segment.end_frame = fidx
+            current_segment.peak_score = max(current_segment.peak_score, score)
+            current_segment.peak_angle_deg = max(current_segment.peak_angle_deg, angle_deg)
+
+        level = new_level
+        per_frame.append(CleaningFrameDiag(fidx, level, score, angle_deg, speed))
+        last_x, last_y, last_time = x, y, t
+
+    if current_segment is not None:
+        segments.append(current_segment)
+    return per_frame, segments
+
+
+def detect_stuck_segments(frames: list[dict[str, Any]]) -> tuple[list[bool | None], list[CleaningStuckSegment]]:
+    points: list[tuple[int, float, float, float] | None] = []
+    for index, frame in enumerate(frames):
+        pose = frame_pose_xy_yaw(frame)
+        if pose is None:
+            points.append(None)
+        else:
+            points.append((index, pose[0], pose[1], frame_sim_time(frame, index)))
+
+    flags: list[bool | None] = [None] * len(frames)
+    first_valid_t = next((item[3] for item in points if item is not None), None)
+    left = 0
+    for index, point in enumerate(points):
+        if point is None:
+            left = index + 1
+            continue
+        _, x, y, t = point
+        while left < index and points[left] is not None and points[left][3] < t - CLEANING_STUCK_WINDOW_SEC:
+            left += 1
+        if left >= len(points) or points[left] is None:
+            continue
+        if first_valid_t is not None and t - first_valid_t < CLEANING_STUCK_WINDOW_SEC:
+            flags[index] = False
+            continue
+        _, x0, y0, _ = points[left]
+        flags[index] = math.hypot(x - x0, y - y0) < CLEANING_STUCK_MAX_DISPLACEMENT_CM
+
+    segments: list[CleaningStuckSegment] = []
+    current: CleaningStuckSegment | None = None
+    current_start_index = 0
+    for index, flag in enumerate(flags):
+        if flag is True:
+            fidx = int(frames[index].get("frame_index", index))
+            if current is None:
+                current = CleaningStuckSegment(index, index, fidx, fidx, 0.0, math.inf)
+                current_start_index = index
+            else:
+                current.end_index = index
+                current.end_frame = fidx
+            point = points[index]
+            start_point = points[current_start_index]
+            if point is not None and start_point is not None:
+                current.duration_sec = point[3] - start_point[3]
+                min_disp = math.inf
+                for j in range(current_start_index, index + 1):
+                    p = points[j]
+                    if p is None:
+                        continue
+                    min_disp = min(min_disp, math.hypot(point[1] - p[1], point[2] - p[2]))
+                current.min_displacement_cm = min_disp
+        elif current is not None:
+            if math.isinf(current.min_displacement_cm):
+                current.min_displacement_cm = 0.0
+            segments.append(current)
+            current = None
+    if current is not None:
+        if math.isinf(current.min_displacement_cm):
+            current.min_displacement_cm = 0.0
+        segments.append(current)
+    return flags, segments
+
+
+def judge_cleaning_validity(
+    per_frame: list[CleaningFrameDiag | None],
+    segments: list[CleaningSegment],
+    stuck_flags: list[bool | None],
+    fps: float,
+) -> tuple[list[dict[str, Any]], bool]:
+    moving = [item for item in per_frame if item is not None and item.speed_cm_sec > 0]
+    bad_frames = [item for item in per_frame if item is not None and item.level != LEVEL_OK]
+    hard_frames = [item for item in per_frame if item is not None and item.level == LEVEL_HARD]
+    rules: list[dict[str, Any]] = []
+
+    violation_ratio = len(bad_frames) / len(moving) if moving else 0.0
+    if violation_ratio > CLEANING_MAX_VIOLATION_RATIO:
+        rules.append(
+            {
+                "rule": "violation_ratio_exceeded",
+                "value": round(violation_ratio, 4),
+                "limit": CLEANING_MAX_VIOLATION_RATIO,
+            }
+        )
+
+    hard_min_frames = CLEANING_HARD_MIN_DURATION_SEC * fps
+    longest_hard = max(
+        (segment.end_frame - segment.start_frame + 1 for segment in segments if segment.level == LEVEL_HARD),
+        default=0,
+    )
+    if longest_hard >= hard_min_frames:
+        rules.append(
+            {
+                "rule": "hard_segment_too_long",
+                "longest_hard_frames": longest_hard,
+                "limit_frames": round(hard_min_frames, 1),
+            }
+        )
+
+    hard_ratio = len(hard_frames) / len(moving) if moving else 0.0
+    if hard_ratio > CLEANING_MAX_HARD_RATIO:
+        rules.append(
+            {
+                "rule": "hard_ratio_exceeded",
+                "value": round(hard_ratio, 4),
+                "limit": CLEANING_MAX_HARD_RATIO,
+            }
+        )
+
+    stuck_count = sum(1 for item in stuck_flags if item is True)
+    stuck_ratio = stuck_count / len(stuck_flags) if stuck_flags else 0.0
+    stuck_rule_triggered = stuck_ratio > CLEANING_MAX_STUCK_RATIO
+    if stuck_rule_triggered:
+        rules.append(
+            {
+                "rule": "stuck_ratio_exceeded",
+                "value": round(stuck_ratio, 4),
+                "limit": CLEANING_MAX_STUCK_RATIO,
+                "stuck_frames": stuck_count,
+            }
+        )
+    return rules, stuck_rule_triggered
+
+
+def segment_yaw_delta(frames: list[dict[str, Any]], start: int, end: int) -> float:
+    total = 0.0
+    previous: float | None = None
+    for index in range(start, end + 1):
+        pose = frame_pose_xy_yaw(frames[index])
+        if pose is None:
+            previous = None
+            continue
+        yaw = pose[2]
+        if previous is not None:
+            total += yaw_delta_deg(previous, yaw)
+        previous = yaw
+    return total
+
+
+def evenly_spaced_indices(start: int, end: int, count: int) -> set[int]:
+    """在 [start, end] 内取最多 count 个均匀分布的索引（始终包含首尾）。"""
+    if end <= start:
+        return {start}
+    count = max(2, min(count, end - start + 1))
+    return {start + round(step * (end - start) / (count - 1)) for step in range(count)}
+
+
+def episode_xy_span_cm(frames: list[dict[str, Any]]) -> float | None:
+    """整段轨迹 XY 位置包围盒的对角线长度（cm）。有效位姿不足 2 个时返回 None。"""
+    xs: list[float] = []
+    ys: list[float] = []
+    for frame in frames:
+        pose = frame_pose_xy_yaw(frame)
+        if pose is not None:
+            xs.append(pose[0])
+            ys.append(pose[1])
+    if len(xs) < 2:
+        return None
+    return math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+
+
+def compressed_stuck_keep_indices(
+    frames: list[dict[str, Any]],
+    stuck_flags: list[bool | None],
+    stuck_segments: list[CleaningStuckSegment],
+    fps: float,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    keep = {index for index, flag in enumerate(stuck_flags) if flag is not True}
+    segment_reports: list[dict[str, Any]] = []
+
+    for segment_index, segment in enumerate(stuck_segments):
+        start = segment.start_index
+        end = segment.end_index
+        segment_indices = set(range(start, end + 1))
+        yaw_delta = segment_yaw_delta(frames, start, end)
+        preserve_all = yaw_delta > CLEANING_STUCK_YAW_PRESERVE_THRESHOLD_DEG
+        if preserve_all:
+            selected = segment_indices
+        else:
+            # 固定保留 N 个均匀分布的代表帧（含首尾），与段时长无关，
+            # 这样无论静止持续多久，压缩后都不会残留长时间静止。
+            selected = evenly_spaced_indices(start, end, CLEANING_STUCK_KEEP_FRAMES_PER_SEGMENT)
+            for offset in range(1, CLEANING_STUCK_BOUNDARY_KEEP_FRAMES + 1):
+                if start - offset >= 0:
+                    selected.add(start - offset)
+                if end + offset < len(frames):
+                    selected.add(end + offset)
+        keep.update(selected)
+        segment_reports.append(
+            {
+                "segment_index": segment_index,
+                "start_frame": segment.start_frame,
+                "end_frame": segment.end_frame,
+                "start_index": start,
+                "end_index": end,
+                "original_frames": end - start + 1,
+                "kept_frames": len(selected & segment_indices),
+                "yaw_delta_deg": round(yaw_delta, 3),
+                "preserved_all_due_to_yaw": preserve_all,
+                "duration_sec": round(segment.duration_sec, 3),
+                "min_displacement_cm": round(segment.min_displacement_cm, 3),
+            }
+        )
+    return sorted(keep), segment_reports
+
+
+def build_cleaning_decision(frames: list[dict[str, Any]], fps: float) -> dict[str, Any]:
+    per_frame, direction_segments = diagnose_direction(frames)
+    stuck_flags, stuck_segments = detect_stuck_segments(frames)
+    rules, stuck_rule_triggered = judge_cleaning_validity(per_frame, direction_segments, stuck_flags, fps)
+
+    # 整集级退化静止判据：整段 XY 活动范围极小且几乎没有转向时，视为全程/近乎静止，
+    # 直接整集丢弃（压缩这类集毫无价值，且 stuck 检测的预热豁免会漏判开头的静止帧）。
+    episode_span_cm = episode_xy_span_cm(frames)
+    episode_yaw_delta = segment_yaw_delta(frames, 0, len(frames) - 1) if frames else 0.0
+    if (
+        episode_span_cm is not None
+        and episode_span_cm < CLEANING_MIN_EPISODE_DISPLACEMENT_CM
+        and episode_yaw_delta <= CLEANING_STUCK_YAW_PRESERVE_THRESHOLD_DEG
+    ):
+        rules = rules + [
+            {
+                "rule": "static_episode",
+                "value": round(episode_span_cm, 3),
+                "limit": CLEANING_MIN_EPISODE_DISPLACEMENT_CM,
+                "yaw_delta_deg": round(episode_yaw_delta, 3),
+            }
+        ]
+
+    rule_names = {item["rule"] for item in rules}
+    direction_rules = {
+        "violation_ratio_exceeded",
+        "hard_ratio_exceeded",
+        "hard_segment_too_long",
+    }
+    stuck_frames = sum(1 for item in stuck_flags if item is True)
+    base = {
+        "cleaning_applied": True,
+        "policy": cleaning_policy(),
+        "original_frame_count": len(frames),
+        "stuck_frames": stuck_frames,
+        "stuck_segments": [
+            {
+                "start_frame": segment.start_frame,
+                "end_frame": segment.end_frame,
+                "start_index": segment.start_index,
+                "end_index": segment.end_index,
+                "duration_sec": round(segment.duration_sec, 3),
+                "min_displacement_cm": round(segment.min_displacement_cm, 3),
+            }
+            for segment in stuck_segments
+        ],
+        "direction_segments": [
+            {
+                "level": segment.level,
+                "start_frame": segment.start_frame,
+                "end_frame": segment.end_frame,
+                "peak_score": round(segment.peak_score, 4),
+                "peak_angle_deg": round(segment.peak_angle_deg, 2),
+            }
+            for segment in direction_segments
+        ],
+        "validity_rules": rules,
+    }
+    if "static_episode" in rule_names:
+        return {
+            **base,
+            "decision": "drop_static_episode",
+            "drop_reasons": ["static_episode"],
+            "source_frame_indices": [],
+            "cleaned_frame_count": 0,
+            "dropped_stuck_frame_count": 0,
+            "compressed_stuck_segments": [],
+        }
+
+    if rule_names & direction_rules:
+        return {
+            **base,
+            "decision": "drop_direction_invalid",
+            "drop_reasons": sorted(rule_names & direction_rules),
+            "source_frame_indices": [],
+            "cleaned_frame_count": 0,
+            "dropped_stuck_frame_count": 0,
+            "compressed_stuck_segments": [],
+        }
+
+    if stuck_rule_triggered:
+        keep_indices, segment_reports = compressed_stuck_keep_indices(frames, stuck_flags, stuck_segments, fps)
+        if len(keep_indices) < CLEANING_MIN_CLEANED_FRAMES:
+            return {
+                **base,
+                "decision": "drop_empty_after_clean",
+                "drop_reasons": ["cleaned_frame_count_below_minimum"],
+                "source_frame_indices": keep_indices,
+                "cleaned_frame_count": len(keep_indices),
+                "dropped_stuck_frame_count": len(frames) - len(keep_indices),
+                "compressed_stuck_segments": segment_reports,
+            }
+        return {
+            **base,
+            "decision": "keep_compressed",
+            "drop_reasons": [],
+            "source_frame_indices": keep_indices,
+            "cleaned_frame_count": len(keep_indices),
+            "dropped_stuck_frame_count": len(frames) - len(keep_indices),
+            "compressed_stuck_segments": segment_reports,
+        }
+
+    return {
+        **base,
+        "decision": "keep",
+        "drop_reasons": [],
+        "source_frame_indices": list(range(len(frames))),
+        "cleaned_frame_count": len(frames),
+        "dropped_stuck_frame_count": 0,
+        "compressed_stuck_segments": [],
+    }
 
 
 def normalize_quaternion_xyzw(quaternion: np.ndarray) -> np.ndarray:
@@ -706,6 +1257,7 @@ class CameraImageSource:
     video_path: Path | None
     image_paths: list[Path] | None
     frame_count: int
+    source_frame_indices: list[int] | None = None
 
     @classmethod
     def from_episode(
@@ -715,11 +1267,15 @@ class CameraImageSource:
         camera_key: str,
         frame_count: int,
         allow_extra_tail_frame: bool = False,
+        source_frame_indices: list[int] | None = None,
+        media_frame_count: int | None = None,
     ) -> "CameraImageSource":
         storage = str(rgb_meta.get("storage", "")).strip().lower()
         video_path = episode_dir / "rgb" / f"{camera_key}.mp4"
         image_dir = episode_dir / "rgb" / camera_key
         image_paths = sorted(image_dir.glob("*.png")) if image_dir.is_dir() else []
+        expected_media_frames = int(media_frame_count if media_frame_count is not None else frame_count)
+        selected_indices = list(source_frame_indices) if source_frame_indices is not None else None
 
         if storage == "mp4":
             if image_paths:
@@ -740,15 +1296,15 @@ class CameraImageSource:
                 encoded_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
             finally:
                 capture.release()
-            accepted_counts = {frame_count}
+            accepted_counts = {expected_media_frames}
             if allow_extra_tail_frame:
-                accepted_counts.add(frame_count + 1)
+                accepted_counts.add(expected_media_frames + 1)
             if encoded_count > 0 and encoded_count not in accepted_counts:
                 raise ValueError(
                     f"RGB video frame count mismatch for {episode_dir} camera {camera_key}: "
-                    f"expected {frame_count}, got {encoded_count}"
+                    f"expected {expected_media_frames}, got {encoded_count}"
                 )
-            return cls(video_path=video_path, image_paths=None, frame_count=frame_count)
+            return cls(video_path=video_path, image_paths=None, frame_count=frame_count, source_frame_indices=selected_indices)
 
         if storage == "png_sequence":
             if path_exists(video_path):
@@ -756,34 +1312,40 @@ class CameraImageSource:
                     "Ignoring undeclared RGB MP4 because rgb/meta.json selects png_sequence: %s",
                     video_path,
                 )
-            if len(image_paths) != frame_count:
+            if len(image_paths) != expected_media_frames:
                 raise ValueError(
                     f"RGB frame count mismatch for {episode_dir} camera {camera_key}: "
-                    f"expected {frame_count}, got {len(image_paths)}"
+                    f"expected {expected_media_frames}, got {len(image_paths)}"
                 )
-            return cls(video_path=None, image_paths=image_paths, frame_count=frame_count)
+            return cls(video_path=None, image_paths=image_paths, frame_count=frame_count, source_frame_indices=selected_indices)
 
         raise ValueError(f"Unsupported RGB storage {storage!r} in {episode_dir / 'rgb' / 'meta.json'}")
 
     def iter_rgb(self):
+        indices = self.source_frame_indices or list(range(self.frame_count))
         if self.video_path is not None:
             import cv2
 
+            limit_cv2_threads(cv2)
             capture = cv2.VideoCapture(str(self.video_path))
             if not capture.isOpened():
                 raise ValueError(f"Failed to open video: {self.video_path}")
             try:
-                for index in range(self.frame_count):
+                target_set = set(indices)
+                max_index = max(indices, default=-1)
+                for index in range(max_index + 1):
                     ok, frame = capture.read()
                     if not ok:
                         raise ValueError(f"Video ended early at frame {index}: {self.video_path}")
-                    yield cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    if index in target_set:
+                        yield cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             finally:
                 capture.release()
             return
 
         assert self.image_paths is not None
-        for path in self.image_paths:
+        for index in indices:
+            path = self.image_paths[index]
             with Image.open(path) as image:
                 yield np.asarray(image.convert("RGB"))
 
@@ -806,6 +1368,8 @@ class UnrealEpisode:
         task_mapping: dict[str, Any] | None = None,
         export_depth: bool = True,
         copy_rgb_mp4: bool = False,
+        source_frame_indices: list[int] | None = None,
+        original_frame_count: int | None = None,
     ):
         self.episode_dir = episode_dir
         self.meta = meta
@@ -827,11 +1391,19 @@ class UnrealEpisode:
         self.frame_tasks = list(frame_tasks) if frame_tasks is not None else [task] * len(frames)
         self.task_indices = dict(task_indices or {task: task_idx})
         self.task_mapping = dict(task_mapping or {"status": "legacy_single_task"})
-        self.copy_rgb_mp4 = copy_rgb_mp4
+        self.source_frame_indices = list(source_frame_indices) if source_frame_indices is not None else list(range(len(frames)))
+        self.original_frame_count = int(original_frame_count if original_frame_count is not None else len(self.source_frame_indices))
+        self.has_frame_filter = self.source_frame_indices != list(range(len(self.frames)))
+        self.copy_rgb_mp4 = copy_rgb_mp4 and not self.has_frame_filter
         self.progress_reporter = None
         if len(self.frame_tasks) != len(self.frames):
             raise ValueError(
                 f"frame task count mismatch: frames={len(self.frames)} tasks={len(self.frame_tasks)}"
+            )
+        if len(self.source_frame_indices) != len(self.frames):
+            raise ValueError(
+                f"source frame index count mismatch: frames={len(self.frames)} "
+                f"indices={len(self.source_frame_indices)}"
             )
         self.image_sources = {
             camera: CameraImageSource.from_episode(
@@ -840,6 +1412,8 @@ class UnrealEpisode:
                 camera,
                 len(frames),
                 allow_extra_tail_frame=self.allow_extra_tail_frame,
+                source_frame_indices=self.source_frame_indices,
+                media_frame_count=self.original_frame_count,
             )
             for camera in camera_keys
         }
@@ -895,6 +1469,8 @@ class UnrealEpisode:
             "rgb_media_meta": self.rgb_meta,
             "depth_decode_stats": self.depth_decode_stats,
         }
+        if self.meta.get("_cleaning"):
+            metadata["cleaning"] = self.meta["_cleaning"]
         if self.export_depth:
             metadata["depth_media_meta"] = self.depth_meta
             metadata["depth_output_format"] = "uint16_mm_png"
@@ -935,6 +1511,7 @@ class UnrealEpisode:
         try:
             import cv2
 
+            limit_cv2_threads(cv2)
             total_depth_frames = len(self.frames) * len(self.camera_keys)
             decoded_depth_frames = 0
             for camera in self.camera_keys:
@@ -954,16 +1531,22 @@ class UnrealEpisode:
                 min_valid_mm: int | None = None
                 max_valid_mm: int | None = None
                 try:
-                    for frame_index in range(len(self.frames)):
+                    target_set = set(self.source_frame_indices)
+                    max_source_frame = max(self.source_frame_indices, default=-1)
+                    output_frame_index = 0
+                    for source_frame_index in range(max_source_frame + 1):
                         ok, bgr = capture.read()
                         if not ok:
                             raise ValueError(
                                 f"Depth video ended early for {self.episode_dir} camera {camera}: "
-                                f"expected {len(self.frames)} frames, got {frame_index}"
+                                f"expected source frame {source_frame_index}"
                             )
+                        if source_frame_index not in target_set:
+                            continue
                         rgb = bgr[..., ::-1]
                         depth_mm, valid = decode_hue_depth_rgb(rgb, min_meters, max_meters)
-                        Image.fromarray(depth_mm).save(camera_dir / f"{frame_index:05d}.png")
+                        Image.fromarray(depth_mm).save(camera_dir / f"{output_frame_index:05d}.png")
+                        output_frame_index += 1
                         decoded_depth_frames += 1
                         self.report_progress(
                             "depth_decode",
@@ -980,6 +1563,19 @@ class UnrealEpisode:
                             frame_max = int(valid_depth.max())
                             min_valid_mm = frame_min if min_valid_mm is None else min(min_valid_mm, frame_min)
                             max_valid_mm = frame_max if max_valid_mm is None else max(max_valid_mm, frame_max)
+
+                    if output_frame_index != len(self.frames):
+                        raise ValueError(
+                            f"Depth frame selection mismatch for {self.episode_dir} camera {camera}: "
+                            f"expected {len(self.frames)}, wrote {output_frame_index}"
+                        )
+                    for _source_frame_index in range(max_source_frame + 1, self.original_frame_count):
+                        ok, _ = capture.read()
+                        if not ok:
+                            raise ValueError(
+                                f"Depth video ended early for {self.episode_dir} camera {camera}: "
+                                f"expected {self.original_frame_count} source frames"
+                            )
 
                     ok, _ = capture.read()
                     if ok and self.allow_extra_tail_frame:
@@ -1109,6 +1705,7 @@ class UnrealEpisodeCollection:
         export_depth: bool = True,
         copy_rgb_mp4: bool = False,
         log_interval_seconds: float = 30.0,
+        clean_invalid_data: bool = False,
     ):
         self.raw_dir = Path(raw_dir)
         self.camera_keys = camera_keys
@@ -1121,6 +1718,7 @@ class UnrealEpisodeCollection:
         self.trim_extra_tail_frame = trim_extra_tail_frame
         self.export_depth = export_depth
         self.copy_rgb_mp4 = copy_rgb_mp4
+        self.clean_invalid_data = clean_invalid_data
         self.log_interval_seconds = max(1.0, float(log_interval_seconds))
         self.failed_episodes: list[dict[str, Any]] = list(initial_failures or [])
         self.repaired_episodes: list[dict[str, Any]] = list(initial_repairs or [])
@@ -1145,6 +1743,9 @@ class UnrealEpisodeCollection:
             episode_dir, meta, frames = episode[:3]
             try:
                 frames = self._repair_frames_if_needed(episode_dir, meta, frames)
+                frames = self._clean_frames_if_needed(episode_dir, meta, frames)
+                if frames is None:
+                    continue
                 episode = (episode_dir, meta, frames, *episode[3:])
                 schema_candidates.append((episode_schema(meta), episode))
             except Exception as exc:
@@ -1166,6 +1767,7 @@ class UnrealEpisodeCollection:
 
         if not schema_candidates:
             if self.skip_invalid_episodes:
+                self.episodes = []
                 self.fps = 0
                 self.image_size = (0, 0)
                 self.FEATURES = {}
@@ -1187,6 +1789,7 @@ class UnrealEpisodeCollection:
         self.episodes = compatible
         if not self.episodes:
             if self.skip_invalid_episodes:
+                self.episodes = []
                 self.fps = 0
                 self.image_size = (0, 0)
                 self.FEATURES = {}
@@ -1336,6 +1939,9 @@ class UnrealEpisodeCollection:
         )
 
     def _repair_frames_if_needed(self, episode_dir: Path, meta: dict[str, Any], frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleaning = meta.get("_cleaning") or {}
+        if cleaning and len(frames) == int(cleaning.get("cleaned_frame_count", len(frames))):
+            return frames
         expected = int(meta.get("frame_count", len(frames)))
         if len(frames) == expected:
             return frames
@@ -1364,6 +1970,66 @@ class UnrealEpisodeCollection:
 
         raise ValueError(f"frame_count mismatch: meta={meta.get('frame_count')} frames={len(frames)}")
 
+    def _clean_frames_if_needed(
+        self,
+        episode_dir: Path,
+        meta: dict[str, Any],
+        frames: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        if not self.clean_invalid_data:
+            return frames
+        if meta.get("_cleaning"):
+            return frames
+
+        fps = float(meta.get("sample_rate_hz") or 10.0)
+        decision = build_cleaning_decision(frames, fps)
+        decision["source_episode_path"] = str(episode_dir)
+        meta["_cleaning"] = decision
+
+        if decision["decision"] in {"drop_direction_invalid", "drop_empty_after_clean", "drop_static_episode"}:
+            self.excluded_episodes.append(
+                {
+                    "source_episode_path": str(episode_dir),
+                    "stage": "data_cleaning",
+                    "reason": decision["decision"],
+                    "drop_reasons": decision.get("drop_reasons", []),
+                    "validity_rules": decision.get("validity_rules", []),
+                    "original_frame_count": decision.get("original_frame_count"),
+                    "cleaned_frame_count": decision.get("cleaned_frame_count"),
+                    "stuck_frames": decision.get("stuck_frames"),
+                }
+            )
+            logging.debug(
+                "Excluding episode during data cleaning: %s reason=%s",
+                episode_dir,
+                decision["decision"],
+            )
+            return None
+
+        if decision["decision"] == "keep_compressed":
+            indices = [int(index) for index in decision["source_frame_indices"]]
+            cleaned_frames = [frames[index] for index in indices]
+            self.repaired_episodes.append(
+                {
+                    "source_episode_path": str(episode_dir),
+                    "stage": "data_cleaning",
+                    "action": "compressed_stuck_frames",
+                    "original_frame_count": len(frames),
+                    "cleaned_frame_count": len(cleaned_frames),
+                    "dropped_stuck_frame_count": decision.get("dropped_stuck_frame_count", 0),
+                    "compressed_stuck_segments": decision.get("compressed_stuck_segments", []),
+                }
+            )
+            logging.debug(
+                "Compressed stuck frames in %s: %d -> %d",
+                episode_dir,
+                len(frames),
+                len(cleaned_frames),
+            )
+            return cleaned_frames
+
+        return frames
+
     def for_schema(self, schema: tuple[int, tuple[int, int]]) -> "UnrealEpisodeCollection":
         return UnrealEpisodeCollection(
             raw_dir=self.raw_dir,
@@ -1376,6 +2042,7 @@ class UnrealEpisodeCollection:
             trim_extra_tail_frame=self.trim_extra_tail_frame,
             export_depth=self.export_depth,
             copy_rgb_mp4=self.copy_rgb_mp4,
+            clean_invalid_data=self.clean_invalid_data,
             initial_episodes=self.schema_valid_episodes,
             initial_failures=self.failed_episodes,
             initial_repairs=self.repaired_episodes,
@@ -1402,6 +2069,7 @@ class UnrealEpisodeCollection:
             trim_extra_tail_frame=self.trim_extra_tail_frame,
             export_depth=self.export_depth,
             copy_rgb_mp4=self.copy_rgb_mp4,
+            clean_invalid_data=self.clean_invalid_data,
             initial_episodes=episodes,
             initial_failures=[],
             initial_repairs=[
@@ -1424,7 +2092,22 @@ class UnrealEpisodeCollection:
     def __iter__(self):
         for episode in self.episodes:
             episode_dir, meta, frames, task, task_info, body_from_camera, rgb_meta, depth_meta = episode
-            frame_tasks, task_mapping = resolve_frame_tasks(task_info, len(frames), task)
+            cleaning = meta.get("_cleaning") or {}
+            source_frame_indices = cleaning.get("source_frame_indices") or list(range(len(frames)))
+            original_frame_count = int(cleaning.get("original_frame_count") or len(frames))
+            if cleaning:
+                original_frame_tasks, task_mapping = resolve_frame_tasks(task_info, original_frame_count, task)
+                frame_tasks = [original_frame_tasks[int(index)] for index in source_frame_indices]
+                task_mapping = {
+                    **task_mapping,
+                    "cleaning_frame_filter": {
+                        "decision": cleaning.get("decision"),
+                        "original_frame_count": original_frame_count,
+                        "cleaned_frame_count": len(frames),
+                    },
+                }
+            else:
+                frame_tasks, task_mapping = resolve_frame_tasks(task_info, len(frames), task)
             task_indices = {
                 frame_task: self.get_task_idx(frame_task)
                 for frame_task in dict.fromkeys(frame_tasks)
@@ -1457,6 +2140,8 @@ class UnrealEpisodeCollection:
                     task_mapping,
                     export_depth=self.export_depth,
                     copy_rgb_mp4=self.copy_rgb_mp4,
+                    source_frame_indices=[int(index) for index in source_frame_indices],
+                    original_frame_count=original_frame_count,
                 )
             except Exception as exc:
                 self._record_failure(episode_dir, "episode_prepare", exc)
@@ -1524,6 +2209,8 @@ class UnrealEpisodeCollection:
                 "schema_key": schema_suffix((self.fps, self.image_size)) if self.fps else "",
             },
             "schema_groups": list(self.schema_groups.values()),
+            "clean_invalid_data": self.clean_invalid_data,
+            "cleaning_policy": cleaning_policy() if self.clean_invalid_data else None,
             "num_prepared": len(self.prepared_episodes),
             "num_successful": len(self.successful_episodes),
             "num_failed": len(self.failed_episodes),
@@ -1618,6 +2305,7 @@ def save_scan_cache(path: Path, collection: UnrealEpisodeCollection, args) -> No
         "split_by_schema": bool(args.split_by_schema),
         "export_depth": collection.export_depth,
         "copy_rgb_mp4": collection.copy_rgb_mp4,
+        "clean_invalid_data": collection.clean_invalid_data,
         "episodes": collection.schema_valid_episodes,
         "failed_episodes": collection.failed_episodes,
         "repaired_episodes": collection.repaired_episodes,
@@ -1646,6 +2334,8 @@ def load_scan_cache(path: Path, raw_dir: Path, camera_keys: list[str], args) -> 
         raise ValueError("Scan cache trim_extra_tail_frame mismatch.")
     if bool(payload.get("split_by_schema")) != bool(args.split_by_schema):
         raise ValueError("Scan cache split_by_schema mismatch.")
+    if bool(payload.get("clean_invalid_data", False)) != bool(getattr(args, "clean_invalid_data", False)):
+        raise ValueError("Scan cache clean_invalid_data mismatch.")
     if not getattr(args, "skip_depth", False) and payload.get("export_depth") is False:
         raise ValueError("Scan cache was created with --skip_depth and cannot be reused for depth export.")
     if float(payload.get("translation_tolerance_m")) != float(args.extrinsic_tolerance_translation_m):
@@ -1679,6 +2369,7 @@ def collection_from_scan_cache(
         export_depth=not getattr(args, "skip_depth", False),
         copy_rgb_mp4=getattr(args, "copy_rgb_mp4", False),
         log_interval_seconds=getattr(args, "log_interval_seconds", 30.0),
+        clean_invalid_data=getattr(args, "clean_invalid_data", False),
     )
 
 
@@ -2025,6 +2716,7 @@ def main():
             export_depth=not args.skip_depth,
             copy_rgb_mp4=args.copy_rgb_mp4,
             log_interval_seconds=args.log_interval_seconds,
+            clean_invalid_data=args.clean_invalid_data,
         )
         if args.resume or args.scan_cache:
             save_scan_cache(scan_cache_path, collection, args)
